@@ -7,7 +7,11 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, GdkPixbuf, Pango
 
-from encoder import Encoder, EncodeJob, get_fps, HIGH_FPS_THRESHOLD
+from encoder import (
+    Encoder, EncodeJob,
+    get_fps, get_video_dimensions, compute_output_dimensions,
+    HIGH_FPS_THRESHOLD,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -36,6 +40,17 @@ AUDIO_BITRATES = [
 
 DEFAULT_VIDEO_IDX = 3   # 4000 kbps
 DEFAULT_AUDIO_IDX = 2   # 128 kbps
+
+# (label, target_height_or_None)
+RESOLUTIONS = [
+    ("Original (beibehalten)", None),
+    ("480p  (854 × 480)",       480),
+    ("720p  (1280 × 720)",      720),
+    ("1080p (1920 × 1080)",    1080),
+    ("1440p (2560 × 1440)",    1440),
+    ("4K    (3840 × 2160)",    2160),
+]
+DEFAULT_RES_IDX = 0   # Original
 
 # TreeView columns
 COL_FILENAME  = 0
@@ -297,6 +312,23 @@ class MainWindow(Gtk.Window):
         self._combo_abr.set_active(DEFAULT_AUDIO_IDX)
         br_grid.attach(self._combo_abr, 1, 1, 1, 1)
 
+        lbl_res = Gtk.Label(label="Auflösung:")
+        lbl_res.set_halign(Gtk.Align.START)
+        br_grid.attach(lbl_res, 0, 2, 1, 1)
+        self._combo_res = Gtk.ComboBoxText()
+        for label, _ in RESOLUTIONS:
+            self._combo_res.append_text(label)
+        self._combo_res.set_active(DEFAULT_RES_IDX)
+        br_grid.attach(self._combo_res, 1, 2, 1, 1)
+
+        res_note = Gtk.Label()
+        res_note.set_markup(
+            '<small><i>Nicht-16:9-Quellen werden automatisch\n'
+            'im Originalseitenverhältnis skaliert.</i></small>'
+        )
+        res_note.set_halign(Gtk.Align.START)
+        br_grid.attach(res_note, 0, 3, 2, 1)
+
         # High-FPS note
         note = Gtk.Label()
         note.set_markup(
@@ -304,7 +336,7 @@ class MainWindow(Gtk.Window):
             f'Video-Bitrate automatisch verdoppelt.</i></small>'
         )
         note.set_halign(Gtk.Align.START)
-        br_grid.attach(note, 0, 2, 2, 1)
+        br_grid.attach(note, 0, 4, 2, 1)
 
         outer.pack_end(Gtk.Box(), True, True, 0)  # spacer
         return outer
@@ -393,12 +425,13 @@ class MainWindow(Gtk.Window):
             self._show_error("Keine Dateien in der Liste.")
             return
 
-        use_src_dir    = self._chk_src_dir.get_active()
-        replace_orig   = self._radio_replace.get_active()
-        output_dir     = self._entry_outdir.get_text().strip()
-        custom_suffix  = self._entry_suffix.get_text().strip()
-        video_bitrate  = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
-        audio_bitrate  = AUDIO_BITRATES[self._combo_abr.get_active()][1]
+        use_src_dir       = self._chk_src_dir.get_active()
+        replace_orig      = self._radio_replace.get_active()
+        output_dir        = self._entry_outdir.get_text().strip()
+        custom_suffix     = self._entry_suffix.get_text().strip()
+        video_bitrate     = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
+        audio_bitrate     = AUDIO_BITRATES[self._combo_abr.get_active()][1]
+        resolution_height = RESOLUTIONS[self._combo_res.get_active()][1]
 
         if not use_src_dir and not output_dir:
             self._show_error("Bitte ein Ausgabeverzeichnis auswählen.")
@@ -420,6 +453,7 @@ class MainWindow(Gtk.Window):
                     video_bitrate=video_bitrate,
                     audio_bitrate=audio_bitrate,
                     replace_original=replace_orig,
+                    resolution_height=resolution_height,
                 )
             )
 
@@ -453,10 +487,19 @@ class MainWindow(Gtk.Window):
             self._store.set_value(row_iter, COL_PROGRESS, 0)
 
         fps = get_fps(path)
-        fps_note = f" (HFR {fps:.1f} fps → Bitrate x2)" if fps >= HIGH_FPS_THRESHOLD else ""
+        fps_note = f", HFR {fps:.1f} fps → Bitrate x2" if fps >= HIGH_FPS_THRESHOLD else ""
+
+        target_h = job.resolution_height
+        if target_h is not None:
+            src_w, src_h = get_video_dimensions(path)
+            out_w, out_h = compute_output_dimensions(src_w, src_h, target_h)
+            res_note = f", {out_w}×{out_h}"
+        else:
+            res_note = ""
+
         self._status_label.set_text(
             f"Kodiere {self._current_index + 1}/{len(self._jobs)}: "
-            f"{os.path.basename(path)}{fps_note}"
+            f"{os.path.basename(path)}{res_note}{fps_note}"
         )
 
         def on_progress(frac):

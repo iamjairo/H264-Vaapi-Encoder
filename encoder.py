@@ -13,6 +13,7 @@ class EncodeJob:
     video_bitrate: str
     audio_bitrate: str
     replace_original: bool
+    resolution_height: Optional[int] = None   # None = keep original
 
 
 def probe_video(path: str) -> dict:
@@ -42,6 +43,31 @@ def get_fps(path: str) -> float:
     except Exception:
         pass
     return 0.0
+
+
+def get_video_dimensions(path: str) -> tuple[int, int]:
+    """Return (width, height) of the first video stream, or (0, 0)."""
+    try:
+        data = probe_video(path)
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                return int(stream.get("width", 0)), int(stream.get("height", 0))
+    except Exception:
+        pass
+    return 0, 0
+
+
+def compute_output_dimensions(src_w: int, src_h: int, target_h: int) -> tuple[int, int]:
+    """Return output (width, height) preserving aspect ratio for a given target height.
+
+    The width is rounded to the nearest even number as required by most codecs.
+    Example: 1440×1080 source → target_h=720 → 960×720  (4:3 preserved)
+             1920×1080 source → target_h=720 → 1280×720  (16:9 preserved)
+    """
+    if src_h == 0:
+        return 0, target_h
+    out_w = int(round(src_w / src_h * target_h / 2)) * 2
+    return out_w, target_h
 
 
 def get_duration(path: str) -> float:
@@ -91,13 +117,21 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     if fps >= HIGH_FPS_THRESHOLD:
         video_bitrate = _double_bitrate(video_bitrate)
 
+    # Build the VAAPI video filter chain.
+    # scale_vaapi=w=-2:h=H keeps the source aspect ratio and rounds the
+    # computed width to the nearest even number (-2 suffix).
+    if job.resolution_height is not None:
+        vf = f"format=nv12|vaapi,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
+    else:
+        vf = "format=nv12|vaapi,hwupload"
+
     cmd = [
         "ffmpeg",
         "-y",                          # overwrite output
         "-hwaccel", "vaapi",
         "-hwaccel_output_format", "vaapi",
         "-i", job.input_path,
-        "-vf", "format=nv12|vaapi,hwupload",
+        "-vf", vf,
         "-c:v", "h264_vaapi",
         "-b:v", video_bitrate,
         "-c:a", "aac",
