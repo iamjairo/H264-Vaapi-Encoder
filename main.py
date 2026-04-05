@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""H264 VAAPI Encoder – GTK3 GUI"""
+
+import os
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, GdkPixbuf, Pango
+
+from encoder import Encoder, EncodeJob, get_fps, HIGH_FPS_THRESHOLD
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VIDEO_BITRATES = [
+    ("500 kbps",   "500k"),
+    ("1000 kbps",  "1000k"),
+    ("2000 kbps",  "2000k"),
+    ("4000 kbps",  "4000k"),
+    ("6000 kbps",  "6000k"),
+    ("8000 kbps",  "8000k"),
+    ("12000 kbps", "12000k"),
+    ("16000 kbps", "16000k"),
+    ("20000 kbps", "20000k"),
+]
+
+AUDIO_BITRATES = [
+    ("64 kbps",  "64k"),
+    ("96 kbps",  "96k"),
+    ("128 kbps", "128k"),
+    ("192 kbps", "192k"),
+    ("256 kbps", "256k"),
+    ("320 kbps", "320k"),
+]
+
+DEFAULT_VIDEO_IDX = 3   # 4000 kbps
+DEFAULT_AUDIO_IDX = 2   # 128 kbps
+
+# TreeView columns
+COL_FILENAME  = 0
+COL_DIRECTORY = 1
+COL_STATUS    = 2
+COL_PROGRESS  = 3
+COL_FULLPATH  = 4
+
+STATUS_PENDING  = "Ausstehend"
+STATUS_ENCODING = "Wird kodiert…"
+STATUS_DONE     = "Fertig"
+STATUS_ERROR    = "Fehler"
+STATUS_CANCELLED = "Abgebrochen"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_output_path(
+    input_path: str,
+    output_dir: str,
+    use_source_dir: bool,
+    replace_original: bool,
+    custom_suffix: str,
+) -> str:
+    """Compute the output file path from settings."""
+    base, _ = os.path.splitext(input_path)
+    base_name = os.path.basename(base)
+    src_dir   = os.path.dirname(input_path)
+
+    if use_source_dir:
+        target_dir = src_dir
+    else:
+        target_dir = output_dir
+
+    if replace_original:
+        # Write to a temp name, then replace_original logic swaps it later.
+        # Use same dir as source so os.replace works across mount points.
+        return os.path.join(src_dir, f".{base_name}_tmp_enc.mp4")
+    else:
+        out_name = f"{base_name}{custom_suffix}.mp4"
+        return os.path.join(target_dir, out_name)
+
+
+# ---------------------------------------------------------------------------
+# Main Window
+# ---------------------------------------------------------------------------
+
+class MainWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="H264 VAAPI Encoder")
+        self.set_default_size(900, 640)
+        self.set_border_width(0)
+        self.connect("delete-event", self._on_close)
+
+        self._encoder = Encoder()
+        self._queue: list[str] = []   # paths in order
+        self._current_index: int = -1
+        self._encoding_active = False
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI Construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+
+        # ---- Toolbar ---------------------------------------------------
+        toolbar = Gtk.Toolbar()
+        toolbar.get_style_context().add_class(Gtk.STYLE_CLASS_PRIMARY_TOOLBAR)
+        vbox.pack_start(toolbar, False, False, 0)
+
+        btn_add = Gtk.ToolButton()
+        btn_add.set_label("Dateien hinzufügen")
+        btn_add.set_icon_name("document-open")
+        btn_add.connect("clicked", self._on_add_files)
+        toolbar.insert(btn_add, -1)
+
+        btn_remove = Gtk.ToolButton()
+        btn_remove.set_label("Entfernen")
+        btn_remove.set_icon_name("list-remove")
+        btn_remove.connect("clicked", self._on_remove_selected)
+        toolbar.insert(btn_remove, -1)
+
+        sep = Gtk.SeparatorToolItem()
+        sep.set_expand(True)
+        sep.set_draw(False)
+        toolbar.insert(sep, -1)
+
+        self._btn_encode = Gtk.ToolButton()
+        self._btn_encode.set_label("Kodieren starten")
+        self._btn_encode.set_icon_name("media-playback-start")
+        self._btn_encode.connect("clicked", self._on_start_encode)
+        toolbar.insert(self._btn_encode, -1)
+
+        self._btn_cancel = Gtk.ToolButton()
+        self._btn_cancel.set_label("Abbrechen")
+        self._btn_cancel.set_icon_name("process-stop")
+        self._btn_cancel.set_sensitive(False)
+        self._btn_cancel.connect("clicked", self._on_cancel)
+        toolbar.insert(self._btn_cancel, -1)
+
+        # ---- Main area: paned (list | settings) ------------------------
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_border_width(8)
+        paned.set_position(520)
+        vbox.pack_start(paned, True, True, 0)
+
+        # Left: file list
+        paned.pack1(self._build_file_list(), True, True)
+        # Right: settings
+        paned.pack2(self._build_settings(), False, False)
+
+        # ---- Status bar ------------------------------------------------
+        status_box = Gtk.Box(spacing=8)
+        status_box.set_border_width(4)
+        vbox.pack_start(status_box, False, False, 0)
+
+        self._status_label = Gtk.Label(label="Bereit")
+        self._status_label.set_halign(Gtk.Align.START)
+        status_box.pack_start(self._status_label, True, True, 0)
+
+        self._global_progress = Gtk.ProgressBar()
+        self._global_progress.set_size_request(200, -1)
+        status_box.pack_end(self._global_progress, False, False, 0)
+
+    def _build_file_list(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Eingabedateien")
+        frame.set_shadow_type(Gtk.ShadowType.IN)
+
+        # Model: filename, directory, status, progress (0–100), full path
+        self._store = Gtk.ListStore(str, str, str, int, str)
+
+        tv = Gtk.TreeView(model=self._store)
+        tv.set_reorderable(True)
+        tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self._treeview = tv
+
+        def col(title, idx, expand=False):
+            cell = Gtk.CellRendererText()
+            cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+            c = Gtk.TreeViewColumn(title, cell, text=idx)
+            c.set_expand(expand)
+            c.set_resizable(True)
+            tv.append_column(c)
+
+        col("Dateiname",  COL_FILENAME,  expand=True)
+        col("Verzeichnis", COL_DIRECTORY, expand=False)
+        col("Status",     COL_STATUS)
+
+        # Progress column
+        prog_cell = Gtk.CellRendererProgress()
+        prog_col = Gtk.TreeViewColumn("Fortschritt", prog_cell, value=COL_PROGRESS)
+        prog_col.set_min_width(100)
+        tv.append_column(prog_col)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(tv)
+
+        # Drag-and-drop target
+        try:
+            from gi.repository import Gdk
+            tv.drag_dest_set(
+                Gtk.DestDefaults.ALL,
+                [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                Gdk.DragAction.COPY,
+            )
+            tv.connect("drag-data-received", self._on_drag_data)
+        except Exception:
+            pass
+
+        frame.add(sw)
+        return frame
+
+    def _build_settings(self) -> Gtk.Widget:
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_border_width(4)
+
+        # ---- Output path -----------------------------------------------
+        out_frame = Gtk.Frame(label="Ausgabepfad")
+        out_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        out_box.set_border_width(8)
+        out_frame.add(out_box)
+        outer.pack_start(out_frame, False, False, 0)
+
+        # "Use source directory" checkbox
+        self._chk_src_dir = Gtk.CheckButton(
+            label="Im Quellverzeichnis speichern"
+        )
+        self._chk_src_dir.set_active(True)
+        self._chk_src_dir.connect("toggled", self._on_src_dir_toggled)
+        out_box.pack_start(self._chk_src_dir, False, False, 0)
+
+        # Custom output dir row
+        dir_row = Gtk.Box(spacing=4)
+        self._entry_outdir = Gtk.Entry()
+        self._entry_outdir.set_placeholder_text("Ausgabeverzeichnis wählen…")
+        self._entry_outdir.set_sensitive(False)
+        dir_row.pack_start(self._entry_outdir, True, True, 0)
+        btn_browse = Gtk.Button(label="…")
+        btn_browse.connect("clicked", self._on_browse_outdir)
+        dir_row.pack_start(btn_browse, False, False, 0)
+        self._btn_browse_outdir = btn_browse
+        self._btn_browse_outdir.set_sensitive(False)
+        out_box.pack_start(dir_row, False, False, 0)
+
+        Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+
+        # Output naming
+        naming_frame = Gtk.Frame(label="Ausgabename")
+        naming_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        naming_box.set_border_width(8)
+        naming_frame.add(naming_box)
+        outer.pack_start(naming_frame, False, False, 0)
+
+        self._radio_new_name = Gtk.RadioButton.new_with_label(
+            None, "Neuen Namen verwenden"
+        )
+        self._radio_replace = Gtk.RadioButton.new_with_label_from_widget(
+            self._radio_new_name, "Quelldatei ersetzen (Original löschen)"
+        )
+        self._radio_new_name.connect("toggled", self._on_naming_toggled)
+        naming_box.pack_start(self._radio_new_name, False, False, 0)
+        naming_box.pack_start(self._radio_replace, False, False, 0)
+
+        suffix_row = Gtk.Box(spacing=4)
+        suffix_row.pack_start(Gtk.Label(label="Suffix:"), False, False, 0)
+        self._entry_suffix = Gtk.Entry()
+        self._entry_suffix.set_text("_h264")
+        self._entry_suffix.set_width_chars(10)
+        suffix_row.pack_start(self._entry_suffix, False, False, 0)
+        naming_box.pack_start(suffix_row, False, False, 0)
+        self._suffix_row = suffix_row
+
+        # ---- Bitrate settings ------------------------------------------
+        br_frame = Gtk.Frame(label="Bitrate-Einstellungen")
+        br_grid = Gtk.Grid()
+        br_grid.set_column_spacing(8)
+        br_grid.set_row_spacing(8)
+        br_grid.set_border_width(8)
+        br_frame.add(br_grid)
+        outer.pack_start(br_frame, False, False, 0)
+
+        br_grid.attach(Gtk.Label(label="Video-Bitrate:"), 0, 0, 1, 1)
+        self._combo_vbr = Gtk.ComboBoxText()
+        for label, _ in VIDEO_BITRATES:
+            self._combo_vbr.append_text(label)
+        self._combo_vbr.set_active(DEFAULT_VIDEO_IDX)
+        br_grid.attach(self._combo_vbr, 1, 0, 1, 1)
+
+        br_grid.attach(Gtk.Label(label="Audio-Bitrate:"), 0, 1, 1, 1)
+        self._combo_abr = Gtk.ComboBoxText()
+        for label, _ in AUDIO_BITRATES:
+            self._combo_abr.append_text(label)
+        self._combo_abr.set_active(DEFAULT_AUDIO_IDX)
+        br_grid.attach(self._combo_abr, 1, 1, 1, 1)
+
+        # High-FPS note
+        note = Gtk.Label()
+        note.set_markup(
+            f'<small><i>Hinweis: Bei ≥{HIGH_FPS_THRESHOLD} fps wird die\n'
+            f'Video-Bitrate automatisch verdoppelt.</i></small>'
+        )
+        note.set_halign(Gtk.Align.START)
+        br_grid.attach(note, 0, 2, 2, 1)
+
+        outer.pack_end(Gtk.Box(), True, True, 0)  # spacer
+        return outer
+
+    # ------------------------------------------------------------------
+    # Signal Handlers
+    # ------------------------------------------------------------------
+
+    def _on_close(self, *_):
+        if self._encoding_active:
+            self._encoder.cancel()
+        Gtk.main_quit()
+
+    def _on_add_files(self, *_):
+        dialog = Gtk.FileChooserDialog(
+            title="Videodateien auswählen",
+            parent=self,
+            action=Gtk.FileChooserAction.OPEN,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN,   Gtk.ResponseType.OK,
+        )
+        dialog.set_select_multiple(True)
+
+        filt = Gtk.FileFilter()
+        filt.set_name("Videodateien")
+        for ext in ["*.mp4", "*.mkv", "*.avi", "*.mov", "*.wmv",
+                    "*.flv", "*.webm", "*.m4v", "*.ts", "*.mts"]:
+            filt.add_pattern(ext)
+        dialog.add_filter(filt)
+
+        all_filt = Gtk.FileFilter()
+        all_filt.set_name("Alle Dateien")
+        all_filt.add_pattern("*")
+        dialog.add_filter(all_filt)
+
+        if dialog.run() == Gtk.ResponseType.OK:
+            for path in dialog.get_filenames():
+                self._add_file(path)
+        dialog.destroy()
+
+    def _on_remove_selected(self, *_):
+        sel = self._treeview.get_selection()
+        model, paths = sel.get_selected_rows()
+        # Remove in reverse order to keep iters valid
+        for path in reversed(paths):
+            it = model.get_iter(path)
+            full = model.get_value(it, COL_FULLPATH)
+            if full in self._queue:
+                self._queue.remove(full)
+            model.remove(it)
+
+    def _on_src_dir_toggled(self, btn):
+        active = btn.get_active()
+        self._entry_outdir.set_sensitive(not active)
+        self._btn_browse_outdir.set_sensitive(not active)
+
+    def _on_naming_toggled(self, btn):
+        use_new = self._radio_new_name.get_active()
+        self._suffix_row.set_sensitive(use_new)
+
+    def _on_browse_outdir(self, *_):
+        dialog = Gtk.FileChooserDialog(
+            title="Ausgabeverzeichnis wählen",
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OPEN,   Gtk.ResponseType.OK,
+        )
+        if dialog.run() == Gtk.ResponseType.OK:
+            self._entry_outdir.set_text(dialog.get_filename())
+        dialog.destroy()
+
+    def _on_drag_data(self, widget, drag_context, x, y, data, info, time):
+        uris = data.get_uris()
+        for uri in uris:
+            path = uri.replace("file://", "").strip()
+            if os.path.isfile(path):
+                self._add_file(path)
+
+    def _on_start_encode(self, *_):
+        if not self._queue:
+            self._show_error("Keine Dateien in der Liste.")
+            return
+
+        use_src_dir    = self._chk_src_dir.get_active()
+        replace_orig   = self._radio_replace.get_active()
+        output_dir     = self._entry_outdir.get_text().strip()
+        custom_suffix  = self._entry_suffix.get_text().strip()
+        video_bitrate  = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
+        audio_bitrate  = AUDIO_BITRATES[self._combo_abr.get_active()][1]
+
+        if not use_src_dir and not output_dir:
+            self._show_error("Bitte ein Ausgabeverzeichnis auswählen.")
+            return
+
+        self._jobs: list[EncodeJob] = []
+        for path in self._queue:
+            out_path = make_output_path(
+                input_path=path,
+                output_dir=output_dir,
+                use_source_dir=use_src_dir,
+                replace_original=replace_orig,
+                custom_suffix=custom_suffix,
+            )
+            self._jobs.append(
+                EncodeJob(
+                    input_path=path,
+                    output_path=out_path,
+                    video_bitrate=video_bitrate,
+                    audio_bitrate=audio_bitrate,
+                    replace_original=replace_orig,
+                )
+            )
+
+        self._encoding_active = True
+        self._btn_encode.set_sensitive(False)
+        self._btn_cancel.set_sensitive(True)
+        self._current_index = 0
+        self._encode_next()
+
+    def _on_cancel(self, *_):
+        self._encoder.cancel()
+        self._btn_cancel.set_sensitive(False)
+        self._status_label.set_text("Wird abgebrochen…")
+
+    # ------------------------------------------------------------------
+    # Encoding Logic
+    # ------------------------------------------------------------------
+
+    def _encode_next(self):
+        if self._current_index >= len(self._jobs):
+            self._encoding_done()
+            return
+
+        job  = self._jobs[self._current_index]
+        path = job.input_path
+
+        # Find row in store
+        row_iter = self._find_row(path)
+        if row_iter:
+            self._store.set_value(row_iter, COL_STATUS, STATUS_ENCODING)
+            self._store.set_value(row_iter, COL_PROGRESS, 0)
+
+        fps = get_fps(path)
+        fps_note = f" (HFR {fps:.1f} fps → Bitrate x2)" if fps >= HIGH_FPS_THRESHOLD else ""
+        self._status_label.set_text(
+            f"Kodiere {self._current_index + 1}/{len(self._jobs)}: "
+            f"{os.path.basename(path)}{fps_note}"
+        )
+
+        def on_progress(frac):
+            GLib.idle_add(self._update_progress, path, frac)
+
+        def on_done(success, msg):
+            GLib.idle_add(self._job_done, path, success, msg)
+
+        self._encoder.encode(job, on_progress, on_done)
+
+    def _update_progress(self, path: str, frac: float):
+        row_iter = self._find_row(path)
+        if row_iter:
+            self._store.set_value(row_iter, COL_PROGRESS, int(frac * 100))
+        # Global progress
+        total = len(self._jobs)
+        done  = self._current_index
+        global_frac = (done + frac) / total if total else 0
+        self._global_progress.set_fraction(global_frac)
+
+    def _job_done(self, path: str, success: bool, msg: str):
+        row_iter = self._find_row(path)
+        if row_iter:
+            if success:
+                self._store.set_value(row_iter, COL_STATUS,   STATUS_DONE)
+                self._store.set_value(row_iter, COL_PROGRESS, 100)
+            elif msg == "Abgebrochen":
+                self._store.set_value(row_iter, COL_STATUS,   STATUS_CANCELLED)
+            else:
+                self._store.set_value(row_iter, COL_STATUS,   f"{STATUS_ERROR}: {msg}")
+
+        if not success and msg != "Abgebrochen":
+            # Continue with next file even on error
+            pass
+
+        self._current_index += 1
+        if self._encoding_active:
+            self._encode_next()
+
+    def _encoding_done(self):
+        self._encoding_active = False
+        self._btn_encode.set_sensitive(True)
+        self._btn_cancel.set_sensitive(False)
+        self._global_progress.set_fraction(1.0)
+        self._status_label.set_text("Alle Aufgaben abgeschlossen.")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _add_file(self, path: str):
+        if path in self._queue:
+            return
+        self._queue.append(path)
+        self._store.append([
+            os.path.basename(path),
+            os.path.dirname(path),
+            STATUS_PENDING,
+            0,
+            path,
+        ])
+
+    def _find_row(self, path: str):
+        it = self._store.get_iter_first()
+        while it:
+            if self._store.get_value(it, COL_FULLPATH) == path:
+                return it
+            it = self._store.iter_next(it)
+        return None
+
+    def _show_error(self, message: str):
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text=message,
+        )
+        dlg.run()
+        dlg.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    win = MainWindow()
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

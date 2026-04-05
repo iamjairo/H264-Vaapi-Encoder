@@ -1,0 +1,179 @@
+import subprocess
+import json
+import os
+import threading
+from dataclasses import dataclass
+from typing import Optional, Callable
+
+
+@dataclass
+class EncodeJob:
+    input_path: str
+    output_path: str
+    video_bitrate: str
+    audio_bitrate: str
+    replace_original: bool
+
+
+def probe_video(path: str) -> dict:
+    """Return video stream metadata via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_streams",
+        path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr}")
+    data = json.loads(result.stdout)
+    return data
+
+
+def get_fps(path: str) -> float:
+    """Return the frame rate of the first video stream."""
+    try:
+        data = probe_video(path)
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                r_frame_rate = stream.get("r_frame_rate", "0/1")
+                num, den = r_frame_rate.split("/")
+                return float(num) / float(den) if float(den) != 0 else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_duration(path: str) -> float:
+    """Return duration in seconds."""
+    try:
+        data = probe_video(path)
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                dur = stream.get("duration")
+                if dur:
+                    return float(dur)
+        # fallback: format duration
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        fmt = json.loads(result.stdout).get("format", {})
+        if "duration" in fmt:
+            return float(fmt["duration"])
+    except Exception:
+        pass
+    return 0.0
+
+
+HIGH_FPS_THRESHOLD = 40.0
+
+
+def _parse_bitrate_kbps(bitrate_str: str) -> int:
+    """Convert a string like '4000k' or '4000' to integer kbps."""
+    s = bitrate_str.strip().lower().rstrip("k")
+    return int(s)
+
+
+def _double_bitrate(bitrate_str: str) -> str:
+    """Double a bitrate string, preserving the 'k' suffix."""
+    kbps = _parse_bitrate_kbps(bitrate_str)
+    return f"{kbps * 2}k"
+
+
+def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
+    video_bitrate = job.video_bitrate
+    audio_bitrate = job.audio_bitrate
+
+    if fps >= HIGH_FPS_THRESHOLD:
+        video_bitrate = _double_bitrate(video_bitrate)
+
+    cmd = [
+        "ffmpeg",
+        "-y",                          # overwrite output
+        "-hwaccel", "vaapi",
+        "-hwaccel_output_format", "vaapi",
+        "-i", job.input_path,
+        "-vf", "format=nv12|vaapi,hwupload",
+        "-c:v", "h264_vaapi",
+        "-b:v", video_bitrate,
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        job.output_path,
+    ]
+    return cmd
+
+
+class Encoder:
+    def __init__(self):
+        self._process: Optional[subprocess.Popen] = None
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+
+    def encode(
+        self,
+        job: EncodeJob,
+        on_progress: Callable[[float], None],   # 0.0–1.0
+        on_done: Callable[[bool, str], None],   # success, message
+    ):
+        """Run encoding in a background thread."""
+        self._cancelled = False
+
+        def _run():
+            try:
+                fps = get_fps(job.input_path)
+                duration = get_duration(job.input_path)
+                cmd = build_ffmpeg_cmd(job, fps)
+
+                self._process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+
+                for line in self._process.stdout:
+                    if self._cancelled:
+                        break
+                    # Parse ffmpeg progress from "time=HH:MM:SS.xx"
+                    if duration > 0 and "time=" in line:
+                        try:
+                            time_str = line.split("time=")[1].split()[0]
+                            h, m, s = time_str.split(":")
+                            elapsed = int(h) * 3600 + int(m) * 60 + float(s)
+                            progress = min(elapsed / duration, 1.0)
+                            on_progress(progress)
+                        except Exception:
+                            pass
+
+                self._process.wait()
+
+                if self._cancelled:
+                    # Clean up partial output
+                    if os.path.exists(job.output_path):
+                        os.remove(job.output_path)
+                    on_done(False, "Abgebrochen")
+                    return
+
+                if self._process.returncode != 0:
+                    on_done(False, f"ffmpeg Fehler (Code {self._process.returncode})")
+                    return
+
+                if job.replace_original:
+                    os.replace(job.output_path, job.input_path)
+
+                on_done(True, "")
+
+            except Exception as exc:
+                on_done(False, str(exc))
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
