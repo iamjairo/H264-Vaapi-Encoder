@@ -13,7 +13,9 @@ class EncodeJob:
     video_bitrate: str
     audio_bitrate: str
     replace_original: bool
-    resolution_height: Optional[int] = None   # None = keep original
+    resolution_height: Optional[int] = None      # None = keep original
+    selected_audio: Optional[list[int]] = None   # rel. indices; None = all
+    selected_subtitles: Optional[list[int]] = None  # rel. indices; None = none
 
 
 def probe_video(path: str) -> dict:
@@ -68,6 +70,48 @@ def compute_output_dimensions(src_w: int, src_h: int, target_h: int) -> tuple[in
         return 0, target_h
     out_w = int(round(src_w / src_h * target_h / 2)) * 2
     return out_w, target_h
+
+
+def get_streams(path: str) -> tuple[list[dict], list[dict]]:
+    """Return (audio_streams, subtitle_streams) for a file.
+
+    Each audio dict:   {rel_idx, codec, language, title, channels, channel_layout, enabled}
+    Each subtitle dict:{rel_idx, codec, language, title, enabled}
+    """
+    audio: list[dict] = []
+    subtitles: list[dict] = []
+    try:
+        data = probe_video(path)
+        a_idx = s_idx = 0
+        for stream in data.get("streams", []):
+            ctype = stream.get("codec_type", "")
+            codec = stream.get("codec_name", "?")
+            tags  = stream.get("tags", {})
+            lang  = tags.get("language") or tags.get("LANGUAGE") or ""
+            title = tags.get("title")    or tags.get("TITLE")    or ""
+            if ctype == "audio":
+                audio.append({
+                    "rel_idx":        a_idx,
+                    "codec":          codec,
+                    "language":       lang,
+                    "title":          title,
+                    "channels":       stream.get("channels", 0),
+                    "channel_layout": stream.get("channel_layout", ""),
+                    "enabled":        True,
+                })
+                a_idx += 1
+            elif ctype == "subtitle":
+                subtitles.append({
+                    "rel_idx":  s_idx,
+                    "codec":    codec,
+                    "language": lang,
+                    "title":    title,
+                    "enabled":  True,
+                })
+                s_idx += 1
+    except Exception:
+        pass
+    return audio, subtitles
 
 
 def get_duration(path: str) -> float:
@@ -125,19 +169,43 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     else:
         vf = "format=nv12|vaapi,hwupload"
 
+    # Determine whether explicit stream mapping is needed.
+    # It is needed when the caller has provided an explicit audio or
+    # subtitle selection (as opposed to None = "ffmpeg default").
+    explicit_map = (
+        job.selected_audio    is not None or
+        job.selected_subtitles is not None
+    )
+
     cmd = [
         "ffmpeg",
-        "-y",                          # overwrite output
+        "-y",
         "-hwaccel", "vaapi",
         "-hwaccel_output_format", "vaapi",
         "-i", job.input_path,
+    ]
+
+    if explicit_map:
+        # Always keep the first video stream.
+        cmd += ["-map", "0:v:0"]
+        for idx in (job.selected_audio or []):
+            cmd += ["-map", f"0:a:{idx}"]
+        for idx in (job.selected_subtitles or []):
+            cmd += ["-map", f"0:s:{idx}"]
+
+    cmd += [
         "-vf", vf,
         "-c:v", "h264_vaapi",
         "-b:v", video_bitrate,
         "-c:a", "aac",
         "-b:a", audio_bitrate,
-        job.output_path,
     ]
+
+    # Subtitle passthrough: use mov_text for MP4 container compatibility.
+    if explicit_map and job.selected_subtitles:
+        cmd += ["-c:s", "mov_text"]
+
+    cmd.append(job.output_path)
     return cmd
 
 

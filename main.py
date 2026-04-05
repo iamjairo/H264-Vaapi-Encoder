@@ -10,7 +10,7 @@ from gi.repository import Gtk, GLib, GdkPixbuf, Pango
 from encoder import (
     Encoder, EncodeJob,
     get_fps, get_video_dimensions, compute_output_dimensions,
-    HIGH_FPS_THRESHOLD,
+    get_streams, HIGH_FPS_THRESHOLD,
 )
 
 # ---------------------------------------------------------------------------
@@ -53,11 +53,13 @@ RESOLUTIONS = [
 DEFAULT_RES_IDX = 0   # Original
 
 # TreeView columns
-COL_FILENAME  = 0
-COL_DIRECTORY = 1
-COL_STATUS    = 2
-COL_PROGRESS  = 3
-COL_FULLPATH  = 4
+COL_FILENAME    = 0
+COL_DIRECTORY   = 1
+COL_STATUS      = 2
+COL_PROGRESS    = 3
+COL_FULLPATH    = 4
+COL_AUDIO_LABEL = 5   # summary text, e.g. "2 Spuren" / "1/3 aktiv"
+COL_SUB_LABEL   = 6   # summary text, e.g. "Keine" / "2 Spuren"
 
 STATUS_PENDING  = "Ausstehend"
 STATUS_ENCODING = "Wird kodiert…"
@@ -110,6 +112,8 @@ class MainWindow(Gtk.Window):
         self._queue: list[str] = []   # paths in order
         self._current_index: int = -1
         self._encoding_active = False
+        # {path: (audio_list, subtitle_list)} – mutable dicts with "enabled" key
+        self._file_streams: dict[str, tuple[list, list]] = {}
 
         self._build_ui()
 
@@ -184,8 +188,9 @@ class MainWindow(Gtk.Window):
         frame = Gtk.Frame(label="Eingabedateien")
         frame.set_shadow_type(Gtk.ShadowType.IN)
 
-        # Model: filename, directory, status, progress (0–100), full path
-        self._store = Gtk.ListStore(str, str, str, int, str)
+        # Model: filename, directory, status, progress (0–100), full path,
+        #        audio-summary, subtitle-summary
+        self._store = Gtk.ListStore(str, str, str, int, str, str, str)
 
         tv = Gtk.TreeView(model=self._store)
         tv.set_reorderable(True)
@@ -209,6 +214,26 @@ class MainWindow(Gtk.Window):
         prog_col = Gtk.TreeViewColumn("Fortschritt", prog_cell, value=COL_PROGRESS)
         prog_col.set_min_width(100)
         tv.append_column(prog_col)
+
+        # Audio tracks column (clickable summary)
+        audio_cell = Gtk.CellRendererText()
+        audio_cell.set_property("foreground", "#2266cc")
+        audio_cell.set_property("underline", Pango.Underline.SINGLE)
+        self._col_audio = Gtk.TreeViewColumn("Audiospuren", audio_cell,
+                                             text=COL_AUDIO_LABEL)
+        self._col_audio.set_min_width(90)
+        tv.append_column(self._col_audio)
+
+        # Subtitle tracks column (clickable summary)
+        sub_cell = Gtk.CellRendererText()
+        sub_cell.set_property("foreground", "#2266cc")
+        sub_cell.set_property("underline", Pango.Underline.SINGLE)
+        self._col_sub = Gtk.TreeViewColumn("Untertitel", sub_cell,
+                                           text=COL_SUB_LABEL)
+        self._col_sub.set_min_width(80)
+        tv.append_column(self._col_sub)
+
+        tv.connect("button-press-event", self._on_treeview_button_press)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -388,6 +413,7 @@ class MainWindow(Gtk.Window):
             full = model.get_value(it, COL_FULLPATH)
             if full in self._queue:
                 self._queue.remove(full)
+            self._file_streams.pop(full, None)
             model.remove(it)
 
     def _on_src_dir_toggled(self, btn):
@@ -446,6 +472,12 @@ class MainWindow(Gtk.Window):
                 replace_original=replace_orig,
                 custom_suffix=custom_suffix,
             )
+            audio_streams, sub_streams = self._file_streams.get(path, ([], []))
+            sel_audio = [s["rel_idx"] for s in audio_streams if s["enabled"]]
+            sel_subs   = [s["rel_idx"] for s in sub_streams  if s["enabled"]]
+            # Use explicit mapping only if stream info was available
+            sel_audio_arg = sel_audio if audio_streams else None
+            sel_subs_arg  = sel_subs  if sub_streams  else None
             self._jobs.append(
                 EncodeJob(
                     input_path=path,
@@ -454,6 +486,8 @@ class MainWindow(Gtk.Window):
                     audio_bitrate=audio_bitrate,
                     replace_original=replace_orig,
                     resolution_height=resolution_height,
+                    selected_audio=sel_audio_arg,
+                    selected_subtitles=sel_subs_arg,
                 )
             )
 
@@ -554,12 +588,16 @@ class MainWindow(Gtk.Window):
         if path in self._queue:
             return
         self._queue.append(path)
+        audio, subs = get_streams(path)
+        self._file_streams[path] = (audio, subs)
         self._store.append([
             os.path.basename(path),
             os.path.dirname(path),
             STATUS_PENDING,
             0,
             path,
+            self._stream_summary(audio),
+            self._stream_summary(subs),
         ])
 
     def _find_row(self, path: str):
@@ -569,6 +607,109 @@ class MainWindow(Gtk.Window):
                 return it
             it = self._store.iter_next(it)
         return None
+
+    # ------------------------------------------------------------------
+    # Stream selection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stream_summary(streams: list[dict]) -> str:
+        """Return a one-line summary for the column cell."""
+        if not streams:
+            return "–"
+        total   = len(streams)
+        enabled = sum(1 for s in streams if s["enabled"])
+        if enabled == 0:
+            return f"Keine ({total})"
+        if enabled == total:
+            return f"Alle ({total})"
+        return f"{enabled}/{total} aktiv"
+
+    @staticmethod
+    def _stream_label(stream: dict, stype: str) -> str:
+        """Human-readable label for a single stream checkbox."""
+        lang  = stream.get("language", "")
+        title = stream.get("title", "")
+        codec = stream.get("codec", "?")
+        name  = title or lang or "unbekannt"
+        idx   = stream["rel_idx"] + 1
+        if stype == "audio":
+            ch = stream.get("channels", 0)
+            layout = stream.get("channel_layout", "")
+            ch_str = layout if layout else (f"{ch}ch" if ch else "")
+            return f"Spur {idx}: {name}  [{codec}, {ch_str}]"
+        else:
+            return f"Spur {idx}: {name}  [{codec}]"
+
+    def _update_stream_summary(self, file_path: str, tree_path):
+        """Recalculate and write summary strings back to the ListStore."""
+        it = self._store.get_iter(tree_path)
+        if not it:
+            return
+        audio, subs = self._file_streams.get(file_path, ([], []))
+        self._store.set_value(it, COL_AUDIO_LABEL, self._stream_summary(audio))
+        self._store.set_value(it, COL_SUB_LABEL,   self._stream_summary(subs))
+
+    def _on_treeview_button_press(self, widget, event):
+        """Open a stream-selection popover when the audio/subtitle column is clicked."""
+        if event.button != 1:
+            return False
+        result = widget.get_path_at_pos(int(event.x), int(event.y))
+        if result is None:
+            return False
+        tree_path, column, _cx, _cy = result
+        if column is self._col_audio:
+            self._show_stream_popover(widget, tree_path, "audio")
+            return True
+        if column is self._col_sub:
+            self._show_stream_popover(widget, tree_path, "subtitle")
+            return True
+        return False
+
+    def _show_stream_popover(self, treeview, tree_path, stype: str):
+        it        = self._store.get_iter(tree_path)
+        file_path = self._store.get_value(it, COL_FULLPATH)
+        audio, subs = self._file_streams.get(file_path, ([], []))
+        streams   = audio if stype == "audio" else subs
+        col       = self._col_audio if stype == "audio" else self._col_sub
+        title_str = "Audiospuren" if stype == "audio" else "Untertitel"
+
+        popover = Gtk.Popover()
+        popover.set_relative_to(treeview)
+        cell_rect = treeview.get_cell_area(tree_path, col)
+        popover.set_pointing_to(cell_rect)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        outer.set_border_width(10)
+
+        hdr = Gtk.Label()
+        hdr.set_markup(f"<b>{title_str}</b>")
+        hdr.set_halign(Gtk.Align.START)
+        outer.pack_start(hdr, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        outer.pack_start(sep, False, False, 2)
+
+        if not streams:
+            lbl = Gtk.Label(label="Keine Spuren gefunden.")
+            lbl.set_sensitive(False)
+            outer.pack_start(lbl, False, False, 0)
+        else:
+            for stream in streams:
+                label = self._stream_label(stream, stype)
+                chk   = Gtk.CheckButton(label=label)
+                chk.set_active(stream["enabled"])
+
+                def _on_toggle(btn, s=stream, fp=file_path, tp=tree_path):
+                    s["enabled"] = btn.get_active()
+                    self._update_stream_summary(fp, tp)
+
+                chk.connect("toggled", _on_toggle)
+                outer.pack_start(chk, False, False, 0)
+
+        popover.add(outer)
+        popover.show_all()
+        popover.popup()
 
     def _show_error(self, message: str):
         dlg = Gtk.MessageDialog(
