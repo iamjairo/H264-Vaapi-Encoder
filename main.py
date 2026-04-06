@@ -314,10 +314,13 @@ class MainWindow(Gtk.Window):
         )
         # "Same name" only makes sense when output goes to a different dir;
         # "Replace" only makes sense when output stays in the source dir.
-        # Initial state: source-dir mode → same-name hidden, replace visible.
-        self._radio_same_name.set_sensitive(False)
+        # set_no_show_all prevents show_all() from overriding visibility;
+        # we then set the correct initial state explicitly (source-dir is
+        # the default → replace visible, same-name hidden).
         self._radio_same_name.set_no_show_all(True)
+        self._radio_same_name.set_visible(False)
         self._radio_replace.set_no_show_all(True)
+        self._radio_replace.set_visible(True)
 
         self._radio_new_name.connect("toggled", self._on_naming_toggled)
         self._radio_same_name.connect("toggled", self._on_naming_toggled)
