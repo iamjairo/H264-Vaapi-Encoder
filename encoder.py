@@ -7,6 +7,13 @@ import threading
 from dataclasses import dataclass
 from typing import Optional, Callable
 
+VIDEO_EXTENSIONS = frozenset([
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
+    ".webm", ".m4v", ".ts", ".mts", ".m2ts",
+    ".mpg", ".mpeg", ".vob", ".3gp", ".ogv",
+    ".rm", ".rmvb", ".divx", ".asf", ".f4v",
+])
+
 
 @dataclass
 class EncodeJob:
@@ -114,6 +121,59 @@ def get_streams(path: str) -> tuple[list[dict], list[dict]]:
     except Exception:
         pass
     return audio, subtitles
+
+
+def get_bitrate_kbps(path: str) -> Optional[int]:
+    """Return overall file bitrate in kbps via ffprobe, or None on failure.
+
+    Only queries the container format header — no decoding, stays fast.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            br = json.loads(result.stdout).get("format", {}).get("bit_rate")
+            if br:
+                return max(1, int(br) // 1000)
+    except Exception:
+        pass
+    return None
+
+
+def scan_folder(
+    folder: str,
+    threshold_kbps: int,
+    on_progress: Callable[[int, int, int, str], None],
+    # (files_checked, total_files, found_count, current_filename)
+    on_found: Callable[[str, int], None],   # (full_path, bitrate_kbps)
+    is_cancelled: Callable[[], bool],
+) -> None:
+    """Recursively scan *folder* for video files whose bitrate > threshold_kbps.
+
+    Designed to run in a background thread; all results are delivered via
+    the provided callbacks which the caller should route through GLib.idle_add.
+    """
+    video_files: list[str] = []
+    for root, _dirs, files in os.walk(folder):
+        for f in sorted(files):
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS:
+                video_files.append(os.path.join(root, f))
+
+    total = len(video_files)
+    found = 0
+    for idx, path in enumerate(video_files):
+        if is_cancelled():
+            break
+        on_progress(idx, total, found, os.path.basename(path))
+        kbps = get_bitrate_kbps(path)
+        if kbps is not None and kbps > threshold_kbps:
+            found += 1
+            on_found(path, kbps)
+
+    on_progress(total, total, found, "")   # final / done signal
 
 
 def get_duration(path: str) -> float:

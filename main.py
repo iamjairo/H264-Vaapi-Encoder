@@ -12,7 +12,7 @@ from gi.repository import Gtk, GLib, GdkPixbuf, Pango
 from encoder import (
     Encoder, EncodeJob,
     get_fps, get_video_dimensions, compute_output_dimensions,
-    get_streams, HIGH_FPS_THRESHOLD,
+    get_streams, scan_folder, HIGH_FPS_THRESHOLD,
 )
 
 # ---------------------------------------------------------------------------
@@ -137,6 +137,12 @@ class MainWindow(Gtk.Window):
         btn_add.set_icon_name("document-open")
         btn_add.connect("clicked", self._on_add_files)
         toolbar.insert(btn_add, -1)
+
+        btn_scan = Gtk.ToolButton()
+        btn_scan.set_label("Ordner scannen")
+        btn_scan.set_icon_name("folder-saved-search")
+        btn_scan.connect("clicked", self._on_scan_folder)
+        toolbar.insert(btn_scan, -1)
 
         btn_remove = Gtk.ToolButton()
         btn_remove.set_label("Entfernen")
@@ -388,6 +394,19 @@ class MainWindow(Gtk.Window):
         if self._encoding_active:
             self._encoder.cancel()
         Gtk.main_quit()
+
+    def _on_scan_folder(self, *_):
+        dlg = ScanDialog(parent=self)
+        dlg.connect("files-selected", self._on_scan_files_selected)
+        dlg.show_all()
+
+    def _on_scan_files_selected(self, _dlg, paths: list):
+        for path in paths:
+            self._add_file(path)
+        n = len(paths)
+        self._status_label.set_text(
+            f"{n} Datei{'en' if n != 1 else ''} aus Scan zur Liste hinzugefügt."
+        )
 
     def _on_add_files(self, *_):
         dialog = Gtk.FileChooserDialog(
@@ -825,6 +844,325 @@ class MainWindow(Gtk.Window):
         dlg.show_all()
         dlg.run()
         dlg.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Scan Dialog
+# ---------------------------------------------------------------------------
+
+class ScanDialog(Gtk.Window):
+    """Stand-alone window that scans a folder tree and collects videos by bitrate."""
+
+    # Custom signal to hand selected paths back to the main window.
+    __gsignals__ = {
+        "files-selected": (
+            GLib.SignalFlags.RUN_FIRST, None, (object,)
+        ),
+    }
+
+    # Result-store column indices
+    _C_CHECK  = 0
+    _C_NAME   = 1
+    _C_DIR    = 2
+    _C_KBPS   = 3
+    _C_PATH   = 4
+
+    def __init__(self, parent: Gtk.Window):
+        super().__init__(title="Ordner nach Videos scannen")
+        self.set_transient_for(parent)
+        self.set_destroy_with_parent(True)
+        self.set_default_size(740, 560)
+        self.set_border_width(0)
+
+        self._cancel_flag = threading.Event()
+        self._scanning    = False
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(root)
+
+        # ---- Settings bar ---------------------------------------------
+        bar = Gtk.Box(spacing=8)
+        bar.set_border_width(10)
+        root.pack_start(bar, False, False, 0)
+
+        bar.pack_start(Gtk.Label(label="Ordner:"), False, False, 0)
+        self._entry_folder = Gtk.Entry()
+        self._entry_folder.set_placeholder_text("Ordner auswählen…")
+        self._entry_folder.set_hexpand(True)
+        bar.pack_start(self._entry_folder, True, True, 0)
+
+        btn_browse = Gtk.Button(label="Durchsuchen…")
+        btn_browse.connect("clicked", self._on_browse)
+        bar.pack_start(btn_browse, False, False, 0)
+
+        bar2 = Gtk.Box(spacing=8)
+        bar2.set_border_width(10)
+        bar2.set_margin_top(0)
+        root.pack_start(bar2, False, False, 0)
+
+        bar2.pack_start(Gtk.Label(label="Bitrate-Schwelle:"), False, False, 0)
+        adj = Gtk.Adjustment(value=7000, lower=100, upper=200000,
+                             step_increment=500, page_increment=5000)
+        self._spin = Gtk.SpinButton(adjustment=adj, climb_rate=500, digits=0)
+        self._spin.set_width_chars(8)
+        bar2.pack_start(self._spin, False, False, 0)
+        bar2.pack_start(Gtk.Label(label="kbps  –  Videos"), False, False, 0)
+        hint = Gtk.Label(label="mit höherer Bitrate werden gefunden")
+        hint.set_sensitive(False)
+        bar2.pack_start(hint, False, False, 0)
+
+        # Scan / Stop buttons
+        btn_box = Gtk.Box(spacing=6)
+        btn_box.set_border_width(10)
+        btn_box.set_margin_top(0)
+        root.pack_start(btn_box, False, False, 0)
+
+        self._btn_scan = Gtk.Button(label="▶  Scannen starten")
+        self._btn_scan.get_style_context().add_class("suggested-action")
+        self._btn_scan.connect("clicked", self._on_scan)
+        btn_box.pack_start(self._btn_scan, False, False, 0)
+
+        self._btn_stop = Gtk.Button(label="■  Stopp")
+        self._btn_stop.set_sensitive(False)
+        self._btn_stop.connect("clicked", self._on_stop)
+        btn_box.pack_start(self._btn_stop, False, False, 0)
+
+        # ---- Progress -------------------------------------------------
+        prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        prog_box.set_border_width(10)
+        prog_box.set_margin_top(0)
+        root.pack_start(prog_box, False, False, 0)
+
+        self._prog_label = Gtk.Label(label=" ")
+        self._prog_label.set_halign(Gtk.Align.START)
+        prog_box.pack_start(self._prog_label, False, False, 0)
+
+        self._prog_bar = Gtk.ProgressBar()
+        prog_box.pack_start(self._prog_bar, False, False, 0)
+
+        # ---- Results list ---------------------------------------------
+        # store: selected(bool), filename, directory, bitrate_kbps, full_path
+        self._store = Gtk.ListStore(bool, str, str, int, str)
+
+        tv = Gtk.TreeView(model=self._store)
+        tv.set_headers_clickable(True)
+
+        # Checkbox column
+        chk_cell = Gtk.CellRendererToggle()
+        chk_cell.connect("toggled", self._on_row_toggled)
+        chk_col = Gtk.TreeViewColumn("", chk_cell, active=self._C_CHECK)
+        chk_col.set_fixed_width(32)
+        tv.append_column(chk_col)
+
+        # Filename
+        name_cell = Gtk.CellRendererText()
+        name_cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        name_col = Gtk.TreeViewColumn("Dateiname", name_cell, text=self._C_NAME)
+        name_col.set_expand(True)
+        name_col.set_resizable(True)
+        tv.append_column(name_col)
+
+        # Directory
+        dir_cell = Gtk.CellRendererText()
+        dir_cell.set_property("ellipsize", Pango.EllipsizeMode.START)
+        dir_col = Gtk.TreeViewColumn("Verzeichnis", dir_cell, text=self._C_DIR)
+        dir_col.set_min_width(140)
+        dir_col.set_resizable(True)
+        tv.append_column(dir_col)
+
+        # Bitrate (rendered as formatted string)
+        br_cell = Gtk.CellRendererText()
+        br_cell.set_property("xalign", 1.0)
+        br_col = Gtk.TreeViewColumn("Bitrate", br_cell)
+        br_col.set_cell_data_func(br_cell, self._render_bitrate)
+        br_col.set_min_width(100)
+        tv.append_column(br_col)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(tv)
+        root.pack_start(sw, True, True, 0)
+
+        # ---- Bottom bar -----------------------------------------------
+        bot = Gtk.Box(spacing=8)
+        bot.set_border_width(10)
+        root.pack_start(bot, False, False, 0)
+
+        self._summary = Gtk.Label(label="Keine Ergebnisse.")
+        self._summary.set_halign(Gtk.Align.START)
+        bot.pack_start(self._summary, True, True, 0)
+
+        btn_all = Gtk.Button(label="Alle")
+        btn_all.connect("clicked", lambda *_: self._set_all(True))
+        bot.pack_start(btn_all, False, False, 0)
+
+        btn_none = Gtk.Button(label="Keine")
+        btn_none.connect("clicked", lambda *_: self._set_all(False))
+        bot.pack_start(btn_none, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        bot.pack_start(sep, False, False, 4)
+
+        self._btn_add = Gtk.Button(label="In Queue übernehmen")
+        self._btn_add.get_style_context().add_class("suggested-action")
+        self._btn_add.set_sensitive(False)
+        self._btn_add.connect("clicked", self._on_add_to_queue)
+        bot.pack_start(self._btn_add, False, False, 0)
+
+        btn_close = Gtk.Button(label="Schließen")
+        btn_close.connect("clicked", lambda *_: self.destroy())
+        bot.pack_start(btn_close, False, False, 0)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _render_bitrate(_col, cell, model, it, _):
+        kbps = model.get_value(it, ScanDialog._C_KBPS)
+        if kbps >= 10000:
+            cell.set_property("text", f"{kbps / 1000:.1f} Mbps")
+        else:
+            cell.set_property("text", f"{kbps:,} kbps".replace(",", "\u202f"))
+
+    def _set_all(self, state: bool):
+        it = self._store.get_iter_first()
+        while it:
+            self._store.set_value(it, self._C_CHECK, state)
+            it = self._store.iter_next(it)
+        self._refresh_summary()
+
+    def _refresh_summary(self):
+        total    = len(self._store)
+        selected = sum(1 for row in self._store if row[self._C_CHECK])
+        self._summary.set_text(
+            f"{total} Video{'s' if total != 1 else ''} gefunden  ·  "
+            f"{selected} ausgewählt"
+        )
+        self._btn_add.set_sensitive(selected > 0)
+
+    # ------------------------------------------------------------------
+    # Signal handlers
+    # ------------------------------------------------------------------
+
+    def _on_browse(self, *_):
+        dlg = Gtk.FileChooserDialog(
+            title="Ordner auswählen",
+            parent=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER,
+        )
+        dlg.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                        Gtk.STOCK_OPEN,   Gtk.ResponseType.OK)
+        if dlg.run() == Gtk.ResponseType.OK:
+            self._entry_folder.set_text(dlg.get_filename())
+        dlg.destroy()
+
+    def _on_row_toggled(self, _cell, path_str):
+        it = self._store.get_iter(path_str)
+        self._store.set_value(it, self._C_CHECK,
+                              not self._store.get_value(it, self._C_CHECK))
+        self._refresh_summary()
+
+    def _on_stop(self, *_):
+        self._cancel_flag.set()
+        self._btn_stop.set_sensitive(False)
+
+    def _on_scan(self, *_):
+        folder = self._entry_folder.get_text().strip()
+        if not folder:
+            return
+        if not os.path.isdir(folder):
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True,
+                                    message_type=Gtk.MessageType.ERROR,
+                                    buttons=Gtk.ButtonsType.OK,
+                                    text=f'Ordner nicht gefunden:\n{folder}')
+            dlg.run(); dlg.destroy()
+            return
+
+        self._store.clear()
+        self._cancel_flag.clear()
+        self._scanning = True
+        self._btn_scan.set_sensitive(False)
+        self._btn_stop.set_sensitive(True)
+        self._btn_add.set_sensitive(False)
+        self._prog_bar.set_fraction(0)
+        self._summary.set_text("Scanne…")
+
+        threshold = int(self._spin.get_value())
+
+        def _on_progress(checked, total, found, current):
+            GLib.idle_add(self._update_progress, checked, total, found, current)
+
+        def _on_found(path, kbps):
+            GLib.idle_add(self._add_result, path, kbps)
+
+        def _run():
+            scan_folder(
+                folder=folder,
+                threshold_kbps=threshold,
+                on_progress=_on_progress,
+                on_found=_on_found,
+                is_cancelled=self._cancel_flag.is_set,
+            )
+            GLib.idle_add(self._scan_finished)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_add_to_queue(self, *_):
+        paths = [row[self._C_PATH] for row in self._store if row[self._C_CHECK]]
+        if paths:
+            self.emit("files-selected", paths)
+            n = len(paths)
+            self._summary.set_text(
+                f"{n} Datei{'en' if n != 1 else ''} zur Konvertierungsliste hinzugefügt."
+            )
+            self._btn_add.set_sensitive(False)
+
+    # ------------------------------------------------------------------
+    # Background-thread callbacks (always called via GLib.idle_add)
+    # ------------------------------------------------------------------
+
+    def _update_progress(self, checked, total, found, current):
+        if total > 0:
+            self._prog_bar.set_fraction(checked / total)
+            label = (f"Geprüft: {checked} / {total}  ·  "
+                     f"Gefunden: {found}"
+                     + (f"  ·  {current}" if current else ""))
+        else:
+            label = "Keine Videodateien gefunden."
+        self._prog_label.set_text(label)
+        return False
+
+    def _add_result(self, path, kbps):
+        self._store.append([
+            True,
+            os.path.basename(path),
+            os.path.dirname(path),
+            kbps,
+            path,
+        ])
+        self._refresh_summary()
+        return False
+
+    def _scan_finished(self):
+        self._scanning = False
+        self._btn_scan.set_sensitive(True)
+        self._btn_stop.set_sensitive(False)
+        self._prog_bar.set_fraction(1.0)
+        total = len(self._store)
+        if total == 0:
+            self._prog_label.set_text("Scan abgeschlossen – keine Videos über dem Schwellenwert.")
+            self._summary.set_text("Keine Ergebnisse.")
+        else:
+            self._prog_label.set_text("Scan abgeschlossen.")
+        return False
 
 
 # ---------------------------------------------------------------------------
