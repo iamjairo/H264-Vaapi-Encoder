@@ -2,7 +2,9 @@
 """H264 VAAPI Encoder – GTK3 GUI"""
 
 import os
+import threading
 import gi
+from urllib.parse import unquote
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, GdkPixbuf, Pango
@@ -440,11 +442,20 @@ class MainWindow(Gtk.Window):
         dialog.destroy()
 
     def _on_drag_data(self, widget, drag_context, x, y, data, info, time):
-        uris = data.get_uris()
-        for uri in uris:
-            path = uri.replace("file://", "").strip()
+        from gi.repository import GLib
+        for uri in data.get_uris():
+            uri = uri.strip()
+            if not uri:
+                continue
+            try:
+                # GLib properly decodes percent-encoded URIs (e.g. spaces → %20)
+                path, _ = GLib.filename_from_uri(uri)
+            except Exception:
+                path = unquote(uri.removeprefix("file://"))
             if os.path.isfile(path):
                 self._add_file(path)
+        # Signal the drag source that the drop was handled successfully.
+        Gtk.drag_finish(drag_context, True, False, time)
 
     def _on_start_encode(self, *_):
         if not self._queue:
@@ -588,17 +599,41 @@ class MainWindow(Gtk.Window):
         if path in self._queue:
             return
         self._queue.append(path)
-        audio, subs = get_streams(path)
-        self._file_streams[path] = (audio, subs)
-        self._store.append([
-            os.path.basename(path),
-            os.path.dirname(path),
-            STATUS_PENDING,
-            0,
-            path,
-            self._stream_summary(audio),
-            self._stream_summary(subs),
-        ])
+        # Placeholder until the background probe completes.
+        self._file_streams[path] = ([], [])
+        row_ref = Gtk.TreeRowReference.new(
+            self._store,
+            self._store.get_path(
+                self._store.append([
+                    os.path.basename(path),
+                    os.path.dirname(path),
+                    STATUS_PENDING,
+                    0,
+                    path,
+                    "Lädt…",
+                    "Lädt…",
+                ])
+            ),
+        )
+
+        # Probe streams off the main thread so D&D / UI never blocks.
+        def _probe():
+            audio, subs = get_streams(path)
+
+            def _apply():
+                self._file_streams[path] = (audio, subs)
+                tp = row_ref.get_path()
+                if tp:
+                    it = self._store.get_iter(tp)
+                    self._store.set_value(it, COL_AUDIO_LABEL,
+                                         self._stream_summary(audio))
+                    self._store.set_value(it, COL_SUB_LABEL,
+                                         self._stream_summary(subs))
+                return False  # run once
+
+            GLib.idle_add(_apply)
+
+        threading.Thread(target=_probe, daemon=True).start()
 
     def _find_row(self, path: str):
         it = self._store.get_iter_first()

@@ -1,6 +1,8 @@
 import subprocess
 import json
 import os
+import glob
+import collections
 import threading
 from dataclasses import dataclass
 from typing import Optional, Callable
@@ -142,6 +144,12 @@ def get_duration(path: str) -> float:
 HIGH_FPS_THRESHOLD = 40.0
 
 
+def find_vaapi_device() -> str:
+    """Return the first available DRI render node, or a sensible default."""
+    devices = sorted(glob.glob("/dev/dri/renderD*"))
+    return devices[0] if devices else "/dev/dri/renderD128"
+
+
 def _parse_bitrate_kbps(bitrate_str: str) -> int:
     """Convert a string like '4000k' or '4000' to integer kbps."""
     s = bitrate_str.strip().lower().rstrip("k")
@@ -161,32 +169,34 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     if fps >= HIGH_FPS_THRESHOLD:
         video_bitrate = _double_bitrate(video_bitrate)
 
-    # Build the VAAPI video filter chain.
-    # scale_vaapi=w=-2:h=H keeps the source aspect ratio and rounds the
-    # computed width to the nearest even number (-2 suffix).
+    # Pipeline: CPU decode → nv12 pixel format → hwupload to VAAPI →
+    # optional scale_vaapi → h264_vaapi encode.
+    #
+    # We intentionally do NOT use -hwaccel vaapi / -hwaccel_output_format
+    # vaapi because that would deliver already-uploaded VAAPI frames to the
+    # filter chain, making a second hwupload call invalid (AVERROR(EINVAL),
+    # exit code 234). CPU decode is slightly less efficient but fully
+    # compatible with every input codec.
+    device = find_vaapi_device()
     if job.resolution_height is not None:
-        vf = f"format=nv12|vaapi,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
+        vf = f"format=nv12,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
     else:
-        vf = "format=nv12|vaapi,hwupload"
+        vf = "format=nv12,hwupload"
 
-    # Determine whether explicit stream mapping is needed.
-    # It is needed when the caller has provided an explicit audio or
-    # subtitle selection (as opposed to None = "ffmpeg default").
+    # Explicit stream mapping is used when the caller supplied an audio or
+    # subtitle selection (list, even if empty) rather than None ("auto").
     explicit_map = (
-        job.selected_audio    is not None or
+        job.selected_audio     is not None or
         job.selected_subtitles is not None
     )
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-hwaccel", "vaapi",
-        "-hwaccel_output_format", "vaapi",
+        "ffmpeg", "-y",
+        "-vaapi_device", device,
         "-i", job.input_path,
     ]
 
     if explicit_map:
-        # Always keep the first video stream.
         cmd += ["-map", "0:v:0"]
         for idx in (job.selected_audio or []):
             cmd += ["-map", f"0:a:{idx}"]
@@ -201,7 +211,6 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
         "-b:a", audio_bitrate,
     ]
 
-    # Subtitle passthrough: use mov_text for MP4 container compatibility.
     if explicit_map and job.selected_subtitles:
         cmd += ["-c:s", "mov_text"]
 
@@ -237,12 +246,16 @@ class Encoder:
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.STDOUT,  # merge so we read both
                     text=True,
                     bufsize=1,
                 )
 
+                # Keep a rolling window of recent output for error reporting.
+                recent = collections.deque(maxlen=40)
+
                 for line in self._process.stdout:
+                    recent.append(line.rstrip())
                     if self._cancelled:
                         break
                     # Parse ffmpeg progress from "time=HH:MM:SS.xx"
@@ -259,14 +272,22 @@ class Encoder:
                 self._process.wait()
 
                 if self._cancelled:
-                    # Clean up partial output
                     if os.path.exists(job.output_path):
                         os.remove(job.output_path)
                     on_done(False, "Abgebrochen")
                     return
 
                 if self._process.returncode != 0:
-                    on_done(False, f"ffmpeg Fehler (Code {self._process.returncode})")
+                    # Find the last meaningful error line (skip progress lines).
+                    error_lines = [
+                        l for l in recent
+                        if l and not l.startswith("frame=") and "time=" not in l
+                        and not l.startswith("size=")
+                    ]
+                    detail = error_lines[-1] if error_lines else "(keine Details)"
+                    on_done(False,
+                            f"ffmpeg Fehler (Code {self._process.returncode}): "
+                            f"{detail}")
                     return
 
                 if job.replace_original:
