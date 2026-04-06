@@ -78,25 +78,25 @@ def make_output_path(
     output_dir: str,
     use_source_dir: bool,
     replace_original: bool,
+    keep_name: bool,
     custom_suffix: str,
 ) -> str:
     """Compute the output file path from settings."""
-    base, _ = os.path.splitext(input_path)
-    base_name = os.path.basename(base)
     src_dir   = os.path.dirname(input_path)
+    base, ext = os.path.splitext(input_path)
+    base_name = os.path.basename(base)
+    orig_name = os.path.basename(input_path)   # full original filename
 
-    if use_source_dir:
-        target_dir = src_dir
-    else:
-        target_dir = output_dir
+    target_dir = src_dir if use_source_dir else output_dir
 
     if replace_original:
-        # Write to a temp name, then replace_original logic swaps it later.
-        # Use same dir as source so os.replace works across mount points.
+        # Temp file in the source directory so os.replace works atomically.
         return os.path.join(src_dir, f".{base_name}_tmp_enc.mp4")
-    else:
-        out_name = f"{base_name}{custom_suffix}.mp4"
-        return os.path.join(target_dir, out_name)
+    if keep_name:
+        # Same filename, different directory — no conflict with the source.
+        return os.path.join(target_dir, orig_name)
+    out_name = f"{base_name}{custom_suffix}.mp4"
+    return os.path.join(target_dir, out_name)
 
 
 # ---------------------------------------------------------------------------
@@ -300,11 +300,23 @@ class MainWindow(Gtk.Window):
         self._radio_new_name = Gtk.RadioButton.new_with_label(
             None, "Neuen Namen verwenden"
         )
+        self._radio_same_name = Gtk.RadioButton.new_with_label_from_widget(
+            self._radio_new_name, "Gleichen Dateinamen behalten"
+        )
         self._radio_replace = Gtk.RadioButton.new_with_label_from_widget(
             self._radio_new_name, "Quelldatei ersetzen (Original löschen)"
         )
+        # "Same name" only makes sense when output goes to a different dir;
+        # "Replace" only makes sense when output stays in the source dir.
+        # Initial state: source-dir mode → same-name hidden, replace visible.
+        self._radio_same_name.set_sensitive(False)
+        self._radio_same_name.set_no_show_all(True)
+        self._radio_replace.set_no_show_all(True)
+
         self._radio_new_name.connect("toggled", self._on_naming_toggled)
+        self._radio_same_name.connect("toggled", self._on_naming_toggled)
         naming_box.pack_start(self._radio_new_name, False, False, 0)
+        naming_box.pack_start(self._radio_same_name, False, False, 0)
         naming_box.pack_start(self._radio_replace, False, False, 0)
 
         suffix_row = Gtk.Box(spacing=4)
@@ -419,19 +431,27 @@ class MainWindow(Gtk.Window):
             model.remove(it)
 
     def _on_src_dir_toggled(self, btn):
-        active = btn.get_active()
-        self._entry_outdir.set_sensitive(not active)
-        self._btn_browse_outdir.set_sensitive(not active)
-        # "Quelldatei ersetzen" only makes sense when the output lands in the
-        # same directory as the source; grey it out otherwise and fall back to
-        # the "new name" option so the user is never left in an invalid state.
-        self._radio_replace.set_sensitive(active)
-        if not active and self._radio_replace.get_active():
+        use_src = btn.get_active()
+        self._entry_outdir.set_sensitive(not use_src)
+        self._btn_browse_outdir.set_sensitive(not use_src)
+
+        # Source-dir mode: "Quelldatei ersetzen" available, "Gleichen Namen"
+        # hidden (would be identical to "ersetzen" in the same folder).
+        # Custom-dir mode: "Gleichen Namen" available, "ersetzen" greyed out.
+        self._radio_replace.set_sensitive(use_src)
+        self._radio_replace.set_visible(use_src)
+        self._radio_same_name.set_sensitive(not use_src)
+        self._radio_same_name.set_visible(not use_src)
+
+        # If the now-hidden option was selected, fall back to "Neuen Namen".
+        if use_src and self._radio_same_name.get_active():
+            self._radio_new_name.set_active(True)
+        if not use_src and self._radio_replace.get_active():
             self._radio_new_name.set_active(True)
 
     def _on_naming_toggled(self, btn):
-        use_new = self._radio_new_name.get_active()
-        self._suffix_row.set_sensitive(use_new)
+        # Suffix only relevant when "Neuen Namen verwenden" is active.
+        self._suffix_row.set_sensitive(self._radio_new_name.get_active())
 
     def _on_browse_outdir(self, *_):
         dialog = Gtk.FileChooserDialog(
@@ -470,6 +490,7 @@ class MainWindow(Gtk.Window):
 
         use_src_dir       = self._chk_src_dir.get_active()
         replace_orig      = self._radio_replace.get_active()
+        keep_name         = self._radio_same_name.get_active()
         output_dir        = self._entry_outdir.get_text().strip()
         custom_suffix     = self._entry_suffix.get_text().strip()
         video_bitrate     = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
@@ -487,6 +508,7 @@ class MainWindow(Gtk.Window):
                 output_dir=output_dir,
                 use_source_dir=use_src_dir,
                 replace_original=replace_orig,
+                keep_name=keep_name,
                 custom_suffix=custom_suffix,
             )
             audio_streams, sub_streams = self._file_streams.get(path, ([], []))
