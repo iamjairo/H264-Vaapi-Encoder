@@ -422,6 +422,12 @@ class MainWindow(Gtk.Window):
         active = btn.get_active()
         self._entry_outdir.set_sensitive(not active)
         self._btn_browse_outdir.set_sensitive(not active)
+        # "Quelldatei ersetzen" only makes sense when the output lands in the
+        # same directory as the source; grey it out otherwise and fall back to
+        # the "new name" option so the user is never left in an invalid state.
+        self._radio_replace.set_sensitive(active)
+        if not active and self._radio_replace.get_active():
+            self._radio_new_name.set_active(True)
 
     def _on_naming_toggled(self, btn):
         use_new = self._radio_new_name.get_active()

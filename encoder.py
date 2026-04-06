@@ -178,6 +178,21 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     # exit code 234). CPU decode is slightly less efficient but fully
     # compatible with every input codec.
     device = find_vaapi_device()
+
+    # Canonical VAAPI pipeline: create a named device context, bind it to
+    # the filter chain, CPU-decode the input, convert to nv12, upload to
+    # the VAAPI device, optionally scale, then hardware-encode.
+    #
+    # -init_hw_device vaapi=va:<dev>  — named device context
+    # -filter_hw_device va            — all HW filters use this context
+    # format=nv12,hwupload            — CPU→GPU upload
+    # scale_vaapi=w=-2:h=H            — optional VAAPI scaler
+    #
+    # We do NOT use -hwaccel/-hwaccel_output_format because that delivers
+    # frames already in VAAPI memory and causes hwupload to fail with
+    # AVERROR(EINVAL) (exit 234).  We do NOT use -vaapi_device because
+    # it is not recognised by all ffmpeg builds and causes AVERROR(ENOSYS)
+    # (exit 218).
     if job.resolution_height is not None:
         vf = f"format=nv12,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
     else:
@@ -192,7 +207,8 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
 
     cmd = [
         "ffmpeg", "-y",
-        "-vaapi_device", device,
+        "-init_hw_device", f"vaapi=va:{device}",
+        "-filter_hw_device", "va",
         "-i", job.input_path,
     ]
 
