@@ -169,32 +169,29 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     if fps >= HIGH_FPS_THRESHOLD:
         video_bitrate = _double_bitrate(video_bitrate)
 
-    # VAAPI pipeline strategy:
-    #   -hwaccel vaapi          — activates VAAPI decode acceleration and
-    #                             creates a shared device context that is
-    #                             reused by hwupload and h264_vaapi encoder.
-    #   -hwaccel_device <dev>   — explicit render node (omitted = auto).
-    #   (no -hwaccel_output_format vaapi) — decoder outputs CPU frames so
-    #                             that the hwupload in the filter chain has
-    #                             something to actually upload.  Passing
-    #                             -hwaccel_output_format vaapi causes the
-    #                             decoder to output already-uploaded frames
-    #                             and hwupload then returns EINVAL (exit 234).
-    #   format=nv12|vaapi       — accept CPU-side nv12 OR pass-through
-    #                             VAAPI frames transparently.
-    #   hwupload                — upload CPU frames to the VAAPI device.
-    #   scale_vaapi=w=-2:h=H   — optional hardware scaler.
-    #   h264_vaapi              — hardware H.264 encoder.
+    # VAAPI pipeline (hardware decode → hardware encode, no CPU round-trip):
+    #
+    #   -hwaccel vaapi                  use VAAPI-accelerated decoder
+    #   -hwaccel_device <renderD*>      explicit DRI node (omitted = auto)
+    #   -hwaccel_output_format vaapi    decoder outputs frames already in
+    #                                   VAAPI GPU memory
+    #   scale_vaapi=w=-2:h=H           optional: GPU-side resize, preserves
+    #                                   aspect ratio (width rounded to even)
+    #   h264_vaapi                      encoder reads from VAAPI memory directly
+    #
+    # hwupload / format=nv12|vaapi must NOT be used here.  They are only
+    # needed for software-decode pipelines.  With -hwaccel_output_format vaapi
+    # the frames are already on the GPU; calling hwupload on them returns
+    # AVERROR(EINVAL) (exit 234).
     device = find_vaapi_device()
-    hw_args = ["-hwaccel", "vaapi"]
+    hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
     if device:
         hw_args += ["-hwaccel_device", device]
 
     if job.resolution_height is not None:
-        vf = (f"format=nv12|vaapi,hwupload,"
-              f"scale_vaapi=w=-2:h={job.resolution_height}")
+        vf_args = ["-vf", f"scale_vaapi=w=-2:h={job.resolution_height}"]
     else:
-        vf = "format=nv12|vaapi,hwupload"
+        vf_args = []   # frames are already VAAPI — no filter needed
 
     explicit_map = (
         job.selected_audio     is not None or
@@ -211,7 +208,7 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
             cmd += ["-map", f"0:s:{idx}"]
 
     cmd += [
-        "-vf", vf,
+        *vf_args,
         "-c:v", "h264_vaapi",
         "-b:v", video_bitrate,
         "-c:a", "aac",
