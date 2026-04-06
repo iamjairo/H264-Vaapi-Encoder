@@ -7,7 +7,7 @@ import gi
 from urllib.parse import unquote
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib, GdkPixbuf, Pango
+from gi.repository import Gtk, GLib, GObject, Pango
 
 from encoder import (
     Encoder, EncodeJob,
@@ -856,7 +856,7 @@ class ScanDialog(Gtk.Window):
     # Custom signal to hand selected paths back to the main window.
     __gsignals__ = {
         "files-selected": (
-            GLib.SignalFlags.RUN_FIRST, None, (object,)
+            GObject.SignalFlags.RUN_FIRST, None, (object,)
         ),
     }
 
