@@ -580,11 +580,12 @@ class MainWindow(Gtk.Window):
             elif msg == "Abgebrochen":
                 self._store.set_value(row_iter, COL_STATUS,   STATUS_CANCELLED)
             else:
-                self._store.set_value(row_iter, COL_STATUS,   f"{STATUS_ERROR}: {msg}")
-
-        if not success and msg != "Abgebrochen":
-            # Continue with next file even on error
-            pass
+                # Show first line in the column (space is limited) and open a
+                # dialog with the full output so the user can read the details.
+                first_line = msg.splitlines()[0]
+                self._store.set_value(row_iter, COL_STATUS,
+                                      f"{STATUS_ERROR}: {first_line}")
+                self._show_error_detail(os.path.basename(path), msg)
 
         self._current_index += 1
         if self._encoding_active:
@@ -760,6 +761,46 @@ class MainWindow(Gtk.Window):
             buttons=Gtk.ButtonsType.OK,
             text=message,
         )
+        dlg.run()
+        dlg.destroy()
+
+    def _show_error_detail(self, filename: str, full_msg: str):
+        """Show a dialog with the complete ffmpeg error output."""
+        dlg = Gtk.Dialog(
+            title=f"Fehler – {filename}",
+            transient_for=self,
+            modal=True,
+        )
+        dlg.set_default_size(640, 380)
+        dlg.add_button("Schließen", Gtk.ResponseType.CLOSE)
+
+        area = dlg.get_content_area()
+        area.set_border_width(12)
+        area.set_spacing(8)
+
+        lbl = Gtk.Label()
+        lbl.set_markup("<b>ffmpeg-Ausgabe:</b>")
+        lbl.set_halign(Gtk.Align.START)
+        area.pack_start(lbl, False, False, 0)
+
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_monospace(True)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.get_buffer().set_text(full_msg)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(tv)
+        area.pack_start(sw, True, True, 0)
+
+        # Scroll to the bottom so the last (most relevant) lines are visible.
+        def _scroll_end(_):
+            adj = sw.get_vadjustment()
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+        dlg.connect("show", _scroll_end)
+
+        dlg.show_all()
         dlg.run()
         dlg.destroy()
 

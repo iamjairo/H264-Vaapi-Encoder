@@ -144,10 +144,10 @@ def get_duration(path: str) -> float:
 HIGH_FPS_THRESHOLD = 40.0
 
 
-def find_vaapi_device() -> str:
-    """Return the first available DRI render node, or a sensible default."""
+def find_vaapi_device() -> Optional[str]:
+    """Return the first available DRI render node, or None if not found."""
     devices = sorted(glob.glob("/dev/dri/renderD*"))
-    return devices[0] if devices else "/dev/dri/renderD128"
+    return devices[0] if devices else None
 
 
 def _parse_bitrate_kbps(bitrate_str: str) -> int:
@@ -169,48 +169,39 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     if fps >= HIGH_FPS_THRESHOLD:
         video_bitrate = _double_bitrate(video_bitrate)
 
-    # Pipeline: CPU decode → nv12 pixel format → hwupload to VAAPI →
-    # optional scale_vaapi → h264_vaapi encode.
-    #
-    # We intentionally do NOT use -hwaccel vaapi / -hwaccel_output_format
-    # vaapi because that would deliver already-uploaded VAAPI frames to the
-    # filter chain, making a second hwupload call invalid (AVERROR(EINVAL),
-    # exit code 234). CPU decode is slightly less efficient but fully
-    # compatible with every input codec.
+    # VAAPI pipeline strategy:
+    #   -hwaccel vaapi          — activates VAAPI decode acceleration and
+    #                             creates a shared device context that is
+    #                             reused by hwupload and h264_vaapi encoder.
+    #   -hwaccel_device <dev>   — explicit render node (omitted = auto).
+    #   (no -hwaccel_output_format vaapi) — decoder outputs CPU frames so
+    #                             that the hwupload in the filter chain has
+    #                             something to actually upload.  Passing
+    #                             -hwaccel_output_format vaapi causes the
+    #                             decoder to output already-uploaded frames
+    #                             and hwupload then returns EINVAL (exit 234).
+    #   format=nv12|vaapi       — accept CPU-side nv12 OR pass-through
+    #                             VAAPI frames transparently.
+    #   hwupload                — upload CPU frames to the VAAPI device.
+    #   scale_vaapi=w=-2:h=H   — optional hardware scaler.
+    #   h264_vaapi              — hardware H.264 encoder.
     device = find_vaapi_device()
+    hw_args = ["-hwaccel", "vaapi"]
+    if device:
+        hw_args += ["-hwaccel_device", device]
 
-    # Canonical VAAPI pipeline: create a named device context, bind it to
-    # the filter chain, CPU-decode the input, convert to nv12, upload to
-    # the VAAPI device, optionally scale, then hardware-encode.
-    #
-    # -init_hw_device vaapi=va:<dev>  — named device context
-    # -filter_hw_device va            — all HW filters use this context
-    # format=nv12,hwupload            — CPU→GPU upload
-    # scale_vaapi=w=-2:h=H            — optional VAAPI scaler
-    #
-    # We do NOT use -hwaccel/-hwaccel_output_format because that delivers
-    # frames already in VAAPI memory and causes hwupload to fail with
-    # AVERROR(EINVAL) (exit 234).  We do NOT use -vaapi_device because
-    # it is not recognised by all ffmpeg builds and causes AVERROR(ENOSYS)
-    # (exit 218).
     if job.resolution_height is not None:
-        vf = f"format=nv12,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
+        vf = (f"format=nv12|vaapi,hwupload,"
+              f"scale_vaapi=w=-2:h={job.resolution_height}")
     else:
-        vf = "format=nv12,hwupload"
+        vf = "format=nv12|vaapi,hwupload"
 
-    # Explicit stream mapping is used when the caller supplied an audio or
-    # subtitle selection (list, even if empty) rather than None ("auto").
     explicit_map = (
         job.selected_audio     is not None or
         job.selected_subtitles is not None
     )
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-init_hw_device", f"vaapi=va:{device}",
-        "-filter_hw_device", "va",
-        "-i", job.input_path,
-    ]
+    cmd = ["ffmpeg", "-y", *hw_args, "-i", job.input_path]
 
     if explicit_map:
         cmd += ["-map", "0:v:0"]
@@ -259,6 +250,9 @@ class Encoder:
                 duration = get_duration(job.input_path)
                 cmd = build_ffmpeg_cmd(job, fps)
 
+                # Log the exact command so it can be reproduced / debugged.
+                print("ffmpeg cmd:", " ".join(cmd), flush=True)
+
                 self._process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -294,15 +288,19 @@ class Encoder:
                     return
 
                 if self._process.returncode != 0:
-                    # Find the last meaningful error line (skip progress lines).
+                    # Build a readable summary from the captured output.
+                    # Skip the per-frame progress lines; keep everything else.
                     error_lines = [
                         l for l in recent
-                        if l and not l.startswith("frame=") and "time=" not in l
+                        if l
+                        and not l.startswith("frame=")
+                        and "time=" not in l
                         and not l.startswith("size=")
+                        and not l.startswith("speed=")
                     ]
-                    detail = error_lines[-1] if error_lines else "(keine Details)"
+                    detail = "\n".join(error_lines[-15:]) if error_lines else "(keine Details)"
                     on_done(False,
-                            f"ffmpeg Fehler (Code {self._process.returncode}): "
+                            f"ffmpeg Fehler (Code {self._process.returncode})\n\n"
                             f"{detail}")
                     return
 
