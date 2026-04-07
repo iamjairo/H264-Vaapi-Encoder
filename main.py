@@ -119,6 +119,17 @@ def make_output_path(
 
 
 # ---------------------------------------------------------------------------
+# Queue persistence
+# ---------------------------------------------------------------------------
+
+QUEUE_FILE = os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
+    "h264-vaapi-encoder",
+    "queue.txt",
+)
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -133,10 +144,11 @@ class MainWindow(Gtk.Window):
         self._queue: list[str] = []   # paths in order
         self._current_index: int = -1
         self._encoding_active = False
-        # {path: (audio_list, subtitle_list)} – mutable dicts with "enabled" key
         self._file_streams: dict[str, tuple[list, list]] = {}
+        self._completed: set[str] = set()   # successfully encoded paths
 
         self._build_ui()
+        self._restore_queue()
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -482,7 +494,9 @@ class MainWindow(Gtk.Window):
             if full in self._queue:
                 self._queue.remove(full)
             self._file_streams.pop(full, None)
+            self._completed.discard(full)
             model.remove(it)
+        self._save_queue()
 
     def _on_src_dir_toggled(self, btn):
         use_src = btn.get_active()
@@ -653,6 +667,8 @@ class MainWindow(Gtk.Window):
             if success:
                 self._store.set_value(row_iter, COL_STATUS,   STATUS_DONE)
                 self._store.set_value(row_iter, COL_PROGRESS, 100)
+                self._completed.add(path)
+                self._save_queue()   # remove finished file from persistent list
             elif msg == "Abgebrochen":
                 self._store.set_value(row_iter, COL_STATUS,   STATUS_CANCELLED)
             else:
@@ -683,6 +699,7 @@ class MainWindow(Gtk.Window):
             return
         self._queue.append(path)
         self._file_streams[path] = ([], [])
+        self._save_queue()   # persist immediately so a crash loses nothing
         row_ref = Gtk.TreeRowReference.new(
             self._store,
             self._store.get_path(
@@ -722,6 +739,47 @@ class MainWindow(Gtk.Window):
             GLib.idle_add(_apply)
 
         threading.Thread(target=_probe, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Queue persistence
+    # ------------------------------------------------------------------
+
+    def _save_queue(self):
+        """Write all not-yet-completed queue paths to QUEUE_FILE."""
+        try:
+            os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
+            pending = [p for p in self._queue if p not in self._completed]
+            with open(QUEUE_FILE, "w", encoding="utf-8") as fh:
+                fh.writelines(p + "\n" for p in pending)
+        except Exception as exc:
+            print(f"[queue] Fehler beim Speichern: {exc}", flush=True)
+
+    @staticmethod
+    def _load_queue() -> list[str]:
+        """Return paths from QUEUE_FILE that still exist on disk."""
+        try:
+            with open(QUEUE_FILE, encoding="utf-8") as fh:
+                return [
+                    line.rstrip("\n")
+                    for line in fh
+                    if line.strip() and os.path.isfile(line.rstrip("\n"))
+                ]
+        except FileNotFoundError:
+            return []
+        except Exception as exc:
+            print(f"[queue] Fehler beim Laden: {exc}", flush=True)
+            return []
+
+    def _restore_queue(self):
+        """Add persisted pending paths back into the queue on startup."""
+        paths = self._load_queue()
+        if not paths:
+            return
+        for path in paths:
+            self._add_file(path)
+        self._status_label.set_text(
+            f"{len(paths)} Datei(en) aus vorheriger Sitzung wiederhergestellt."
+        )
 
     def _find_row(self, path: str):
         it = self._store.get_iter_first()
