@@ -4,6 +4,8 @@ import os
 import glob
 import collections
 import threading
+import queue
+import time
 from dataclasses import dataclass
 from typing import Optional, Callable
 
@@ -295,36 +297,48 @@ def _double_bitrate(bitrate_str: str) -> str:
     return f"{kbps * 2}k"
 
 
-def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
+def build_ffmpeg_cmd(job: EncodeJob, fps: float, software_decode: bool = False) -> list[str]:
     video_bitrate = job.video_bitrate
     audio_bitrate = job.audio_bitrate
 
     if fps >= HIGH_FPS_THRESHOLD:
         video_bitrate = _double_bitrate(video_bitrate)
 
-    # VAAPI pipeline (hardware decode → hardware encode, no CPU round-trip):
-    #
-    #   -hwaccel vaapi                  use VAAPI-accelerated decoder
-    #   -hwaccel_device <renderD*>      explicit DRI node (omitted = auto)
-    #   -hwaccel_output_format vaapi    decoder outputs frames already in
-    #                                   VAAPI GPU memory
-    #   scale_vaapi=w=-2:h=H           optional: GPU-side resize, preserves
-    #                                   aspect ratio (width rounded to even)
-    #   h264_vaapi                      encoder reads from VAAPI memory directly
-    #
-    # hwupload / format=nv12|vaapi must NOT be used here.  They are only
-    # needed for software-decode pipelines.  With -hwaccel_output_format vaapi
-    # the frames are already on the GPU; calling hwupload on them returns
-    # AVERROR(EINVAL) (exit 234).
     device = find_vaapi_device()
-    hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-    if device:
-        hw_args += ["-hwaccel_device", device]
 
-    if job.resolution_height is not None:
-        vf_args = ["-vf", f"scale_vaapi=w=-2:h={job.resolution_height}"]
+    if software_decode:
+        # Software-decode → hardware-encode pipeline.
+        #
+        # The CPU decodes the video; -hwaccel_device sets up a VAAPI device
+        # context so that the filter graph can reference it for hwupload.
+        # Without -hwaccel_output_format vaapi the decoded frames stay in
+        # system memory (NV12), then format=nv12,hwupload sends them to
+        # the GPU for VAAPI encoding.  This is slower but handles any codec
+        # the VAAPI hardware decoder would hang or error on.
+        hw_args = ["-hwaccel", "vaapi"]
+        if device:
+            hw_args += ["-hwaccel_device", device]
+        if job.resolution_height is not None:
+            vf_filter = f"format=nv12,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
+        else:
+            vf_filter = "format=nv12,hwupload"
+        vf_args = ["-vf", vf_filter]
     else:
-        vf_args = []   # frames are already VAAPI — no filter needed
+        # Hardware-decode → hardware-encode pipeline (fastest, no CPU round-trip).
+        #
+        #   -hwaccel_output_format vaapi  decoder outputs frames already in
+        #                                 VAAPI GPU memory.
+        #   scale_vaapi=w=-2:h=H         GPU-side resize (optional).
+        #   h264_vaapi                    encoder reads directly from GPU.
+        #
+        # hwupload must NOT be used: frames are already on the GPU.
+        hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+        if device:
+            hw_args += ["-hwaccel_device", device]
+        if job.resolution_height is not None:
+            vf_args = ["-vf", f"scale_vaapi=w=-2:h={job.resolution_height}"]
+        else:
+            vf_args = []
 
     explicit_map = (
         job.selected_audio     is not None or
@@ -355,6 +369,9 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     return cmd
 
 
+WATCHDOG_TIMEOUT = 30   # seconds of silence before we assume ffmpeg is hung
+
+
 class Encoder:
     def __init__(self):
         self._process: Optional[subprocess.Popen] = None
@@ -365,74 +382,145 @@ class Encoder:
         if self._process and self._process.poll() is None:
             self._process.terminate()
 
+    def _run_ffmpeg(
+        self,
+        cmd: list[str],
+        duration: float,
+        on_progress: Callable[[float], None],
+    ) -> tuple[bool, bool, collections.deque]:
+        """Spawn ffmpeg and read its output.
+
+        Returns (hung, cancelled, recent_lines).
+          hung      – True if the process produced no output for WATCHDOG_TIMEOUT s
+          cancelled – True if self._cancelled was set
+          recent    – rolling window of the last 40 output lines
+        """
+        print("ffmpeg cmd:", " ".join(cmd), flush=True)
+
+        self._process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        recent: collections.deque = collections.deque(maxlen=40)
+        line_queue: queue.Queue = queue.Queue()
+
+        def _reader():
+            for line in self._process.stdout:
+                line_queue.put(line)
+            line_queue.put(None)   # EOF sentinel
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        last_activity = time.monotonic()
+        hung = False
+
+        while True:
+            try:
+                line = line_queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._cancelled:
+                    self._process.kill()
+                    break
+                if time.monotonic() - last_activity > WATCHDOG_TIMEOUT:
+                    print("ffmpeg watchdog: no output for "
+                          f"{WATCHDOG_TIMEOUT}s — killing process", flush=True)
+                    self._process.kill()
+                    hung = True
+                    break
+                continue
+
+            if line is None:    # EOF — process finished
+                break
+
+            last_activity = time.monotonic()
+            recent.append(line.rstrip())
+
+            if self._cancelled:
+                self._process.kill()
+                break
+
+            if duration > 0 and "time=" in line:
+                try:
+                    time_str = line.split("time=")[1].split()[0]
+                    h, m, s = time_str.split(":")
+                    elapsed = int(h) * 3600 + int(m) * 60 + float(s)
+                    on_progress(min(elapsed / duration, 1.0))
+                except Exception:
+                    pass
+
+        self._process.wait()
+        return hung, self._cancelled, recent
+
     def encode(
         self,
         job: EncodeJob,
         on_progress: Callable[[float], None],   # 0.0–1.0
         on_done: Callable[[bool, str], None],   # success, message
     ):
-        """Run encoding in a background thread."""
+        """Run encoding in a background thread with automatic sw-decode fallback."""
         self._cancelled = False
 
         def _run():
             try:
                 fps = get_fps(job.input_path)
                 duration = get_duration(job.input_path)
-                cmd = build_ffmpeg_cmd(job, fps)
 
-                # Log the exact command so it can be reproduced / debugged.
-                print("ffmpeg cmd:", " ".join(cmd), flush=True)
+                # --- Primary attempt: hardware decode + hardware encode ---
+                cmd = build_ffmpeg_cmd(job, fps, software_decode=False)
+                hung, cancelled, recent = self._run_ffmpeg(cmd, duration, on_progress)
 
-                self._process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,  # merge so we read both
-                    text=True,
-                    bufsize=1,
-                )
-
-                # Keep a rolling window of recent output for error reporting.
-                recent = collections.deque(maxlen=40)
-
-                for line in self._process.stdout:
-                    recent.append(line.rstrip())
-                    if self._cancelled:
-                        break
-                    # Parse ffmpeg progress from "time=HH:MM:SS.xx"
-                    if duration > 0 and "time=" in line:
-                        try:
-                            time_str = line.split("time=")[1].split()[0]
-                            h, m, s = time_str.split(":")
-                            elapsed = int(h) * 3600 + int(m) * 60 + float(s)
-                            progress = min(elapsed / duration, 1.0)
-                            on_progress(progress)
-                        except Exception:
-                            pass
-
-                self._process.wait()
-
-                if self._cancelled:
+                if cancelled:
                     if os.path.exists(job.output_path):
                         os.remove(job.output_path)
                     on_done(False, "Abgebrochen")
                     return
 
-                if self._process.returncode != 0:
-                    # Build a readable summary from the captured output.
-                    # Skip the per-frame progress lines; keep everything else.
-                    error_lines = [
-                        l for l in recent
-                        if l
-                        and not l.startswith("frame=")
-                        and "time=" not in l
-                        and not l.startswith("size=")
-                        and not l.startswith("speed=")
-                    ]
-                    detail = "\n".join(error_lines[-15:]) if error_lines else "(keine Details)"
-                    on_done(False,
-                            f"ffmpeg Fehler (Code {self._process.returncode})\n\n"
-                            f"{detail}")
-                    return
+                hw_decode_ok = (not hung and self._process.returncode == 0)
+
+                if not hw_decode_ok:
+                    # Clean up any partial output before retrying.
+                    if os.path.exists(job.output_path):
+                        os.remove(job.output_path)
+
+                    if hung:
+                        print("Hardware-decode pipeline hung — retrying with "
+                              "software decode", flush=True)
+                    else:
+                        print(f"Hardware-decode pipeline failed (code "
+                              f"{self._process.returncode}) — retrying with "
+                              f"software decode", flush=True)
+
+                    # --- Fallback: software decode + hardware encode ---
+                    cmd2 = build_ffmpeg_cmd(job, fps, software_decode=True)
+                    hung2, cancelled2, recent = self._run_ffmpeg(
+                        cmd2, duration, on_progress)
+
+                    if cancelled2:
+                        if os.path.exists(job.output_path):
+                            os.remove(job.output_path)
+                        on_done(False, "Abgebrochen")
+                        return
+
+                    if hung2 or self._process.returncode != 0:
+                        if os.path.exists(job.output_path):
+                            os.remove(job.output_path)
+                        if hung2:
+                            on_done(False, "ffmpeg hängt (kein Fortschritt nach "
+                                    f"{WATCHDOG_TIMEOUT}s) — auch Software-Decode "
+                                    "gescheitert.")
+                        else:
+                            error_lines = _filter_error_lines(recent)
+                            detail = ("\n".join(error_lines[-15:])
+                                      if error_lines else "(keine Details)")
+                            on_done(False,
+                                    f"ffmpeg Fehler (Code {self._process.returncode})"
+                                    f" [Software-Decode]\n\n{detail}")
+                        return
 
                 if job.replace_original:
                     os.replace(job.output_path, job.input_path)
@@ -444,3 +532,14 @@ class Encoder:
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
+
+
+def _filter_error_lines(recent: collections.deque) -> list[str]:
+    return [
+        l for l in recent
+        if l
+        and not l.startswith("frame=")
+        and "time=" not in l
+        and not l.startswith("size=")
+        and not l.startswith("speed=")
+    ]
