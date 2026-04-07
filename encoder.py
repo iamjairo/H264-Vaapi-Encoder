@@ -312,14 +312,17 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float, software_decode: bool = False) 
         # The CPU decodes the video; -hwaccel_device sets up a VAAPI device
         # context so that the filter graph can reference it for hwupload.
         # Without -hwaccel_output_format vaapi the decoded frames stay in
-        # system memory (NV12), then format=nv12,hwupload sends them to
-        # the GPU for VAAPI encoding.  This is slower but handles any codec
-        # the VAAPI hardware decoder would hang or error on.
+        # system memory, then format=nv12,hwupload sends them to the GPU for
+        # VAAPI encoding.
+        #
+        # Scaling is done on the CPU (scale= filter) BEFORE hwupload to avoid
+        # scale_vaapi, which may hang on some codec/driver combinations.
         hw_args = ["-hwaccel", "vaapi"]
         if device:
             hw_args += ["-hwaccel_device", device]
         if job.resolution_height is not None:
-            vf_filter = f"format=nv12,hwupload,scale_vaapi=w=-2:h={job.resolution_height}"
+            # scale on CPU → ensure NV12 → upload to VAAPI
+            vf_filter = f"scale=w=-2:h={job.resolution_height},format=nv12,hwupload"
         else:
             vf_filter = "format=nv12,hwupload"
         vf_args = ["-vf", vf_filter]
