@@ -176,6 +176,79 @@ def scan_folder(
     on_progress(total, total, found, "")   # final / done signal
 
 
+def get_file_metadata(path: str) -> dict:
+    """Return all display metadata in a single ffprobe call.
+
+    Returned dict keys:
+      audio          – list[dict]  (same format as get_streams)
+      subtitles      – list[dict]
+      width          – int
+      height         – int
+      video_kbps     – int | None
+      audio_kbps     – int | None  (first audio stream)
+    """
+    out = dict(audio=[], subtitles=[], width=0, height=0,
+               video_kbps=None, audio_kbps=None)
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return out
+        data = json.loads(result.stdout)
+        fmt  = data.get("format", {})
+
+        overall_kbps: int | None = None
+        raw_br = fmt.get("bit_rate")
+        if raw_br:
+            overall_kbps = max(1, int(raw_br) // 1000)
+
+        a_idx = s_idx = 0
+        for stream in data.get("streams", []):
+            ctype = stream.get("codec_type", "")
+            codec = stream.get("codec_name", "?")
+            tags  = stream.get("tags", {})
+            lang  = tags.get("language") or tags.get("LANGUAGE") or ""
+            title = tags.get("title")    or tags.get("TITLE")    or ""
+
+            if ctype == "video":
+                out["width"]  = stream.get("width",  0)
+                out["height"] = stream.get("height", 0)
+                vbr = stream.get("bit_rate")
+                if vbr:
+                    out["video_kbps"] = max(1, int(vbr) // 1000)
+            elif ctype == "audio":
+                abr = stream.get("bit_rate")
+                if abr and out["audio_kbps"] is None:
+                    out["audio_kbps"] = max(1, int(abr) // 1000)
+                out["audio"].append({
+                    "rel_idx": a_idx, "codec": codec,
+                    "language": lang, "title": title,
+                    "channels": stream.get("channels", 0),
+                    "channel_layout": stream.get("channel_layout", ""),
+                    "enabled": True,
+                })
+                a_idx += 1
+            elif ctype == "subtitle":
+                out["subtitles"].append({
+                    "rel_idx": s_idx, "codec": codec,
+                    "language": lang, "title": title,
+                    "enabled": True,
+                })
+                s_idx += 1
+
+        # Fallback: derive video bitrate from overall minus audio.
+        if out["video_kbps"] is None and overall_kbps:
+            audio_kbps = out["audio_kbps"] or 0
+            out["video_kbps"] = max(1, overall_kbps - audio_kbps)
+
+    except Exception:
+        pass
+    return out
+
+
 def get_duration(path: str) -> float:
     """Return duration in seconds."""
     try:

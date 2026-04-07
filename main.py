@@ -12,7 +12,7 @@ from gi.repository import Gtk, GLib, GObject, Pango
 from encoder import (
     Encoder, EncodeJob,
     get_fps, get_video_dimensions, compute_output_dimensions,
-    get_streams, scan_folder, HIGH_FPS_THRESHOLD,
+    get_file_metadata, scan_folder, HIGH_FPS_THRESHOLD,
 )
 
 # ---------------------------------------------------------------------------
@@ -60,8 +60,27 @@ COL_DIRECTORY   = 1
 COL_STATUS      = 2
 COL_PROGRESS    = 3
 COL_FULLPATH    = 4
-COL_AUDIO_LABEL = 5   # summary text, e.g. "2 Spuren" / "1/3 aktiv"
-COL_SUB_LABEL   = 6   # summary text, e.g. "Keine" / "2 Spuren"
+COL_AUDIO_LABEL = 5
+COL_SUB_LABEL   = 6
+COL_RESOLUTION  = 7   # e.g. "1920×1080"
+COL_VID_BITRATE = 8   # e.g. "4.3 Mbps"
+COL_AUD_BITRATE = 9   # e.g. "128 kbps"
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_kbps(kbps: int | None) -> str:
+    if kbps is None:
+        return "–"
+    if kbps >= 10_000:
+        return f"{kbps / 1000:.1f} Mbps"
+    return f"{kbps:,} kbps".replace(",", "\u202f")   # narrow no-break space
+
+
+def _fmt_resolution(w: int, h: int) -> str:
+    return f"{w}×{h}" if w and h else "–"
 
 STATUS_PENDING  = "Ausstehend"
 STATUS_ENCODING = "Wird kodiert…"
@@ -106,7 +125,7 @@ def make_output_path(
 class MainWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="H264 VAAPI Encoder")
-        self.set_default_size(900, 640)
+        self.set_default_size(1150, 640)
         self.set_border_width(0)
         self.connect("delete-event", self._on_close)
 
@@ -196,9 +215,10 @@ class MainWindow(Gtk.Window):
         frame = Gtk.Frame(label="Eingabedateien")
         frame.set_shadow_type(Gtk.ShadowType.IN)
 
-        # Model: filename, directory, status, progress (0–100), full path,
-        #        audio-summary, subtitle-summary
-        self._store = Gtk.ListStore(str, str, str, int, str, str, str)
+        # filename, directory, status, progress, full-path,
+        # audio-label, sub-label, resolution, vid-bitrate, aud-bitrate
+        self._store = Gtk.ListStore(str, str, str, int, str,
+                                    str, str, str, str, str)
 
         tv = Gtk.TreeView(model=self._store)
         tv.set_reorderable(True)
@@ -242,6 +262,18 @@ class MainWindow(Gtk.Window):
         tv.append_column(self._col_sub)
 
         tv.connect("button-press-event", self._on_treeview_button_press)
+
+        def _right_col(title, col_idx, min_w=80):
+            cell = Gtk.CellRendererText()
+            cell.set_property("xalign", 1.0)
+            c = Gtk.TreeViewColumn(title, cell, text=col_idx)
+            c.set_min_width(min_w)
+            c.set_resizable(True)
+            tv.append_column(c)
+
+        _right_col("Auflösung",    COL_RESOLUTION,  90)
+        _right_col("Video-Bitrate", COL_VID_BITRATE, 90)
+        _right_col("Audio-Bitrate", COL_AUD_BITRATE, 80)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -650,7 +682,6 @@ class MainWindow(Gtk.Window):
         if path in self._queue:
             return
         self._queue.append(path)
-        # Placeholder until the background probe completes.
         self._file_streams[path] = ([], [])
         row_ref = Gtk.TreeRowReference.new(
             self._store,
@@ -661,26 +692,32 @@ class MainWindow(Gtk.Window):
                     STATUS_PENDING,
                     0,
                     path,
-                    "Lädt…",
-                    "Lädt…",
+                    "Lädt…", "Lädt…",   # audio / sub labels
+                    "–", "–", "–",      # resolution / vid-br / aud-br
                 ])
             ),
         )
 
-        # Probe streams off the main thread so D&D / UI never blocks.
+        # Single ffprobe call in background — fills streams AND tech info.
         def _probe():
-            audio, subs = get_streams(path)
+            meta = get_file_metadata(path)
 
             def _apply():
-                self._file_streams[path] = (audio, subs)
+                self._file_streams[path] = (meta["audio"], meta["subtitles"])
                 tp = row_ref.get_path()
                 if tp:
                     it = self._store.get_iter(tp)
                     self._store.set_value(it, COL_AUDIO_LABEL,
-                                         self._stream_summary(audio))
+                                         self._stream_summary(meta["audio"]))
                     self._store.set_value(it, COL_SUB_LABEL,
-                                         self._stream_summary(subs))
-                return False  # run once
+                                         self._stream_summary(meta["subtitles"]))
+                    self._store.set_value(it, COL_RESOLUTION,
+                                         _fmt_resolution(meta["width"], meta["height"]))
+                    self._store.set_value(it, COL_VID_BITRATE,
+                                         _fmt_kbps(meta["video_kbps"]))
+                    self._store.set_value(it, COL_AUD_BITRATE,
+                                         _fmt_kbps(meta["audio_kbps"]))
+                return False
 
             GLib.idle_add(_apply)
 
