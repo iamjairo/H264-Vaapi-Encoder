@@ -297,7 +297,7 @@ def _double_bitrate(bitrate_str: str) -> str:
     return f"{kbps * 2}k"
 
 
-def build_ffmpeg_cmd(job: EncodeJob, fps: float, software_decode: bool = False) -> list[str]:
+def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     video_bitrate = job.video_bitrate
     audio_bitrate = job.audio_bitrate
 
@@ -306,42 +306,36 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float, software_decode: bool = False) 
 
     device = find_vaapi_device()
 
-    if software_decode:
-        # Software-decode → hardware-encode pipeline.
+    if job.resolution_height is not None:
+        # Scaling needed → software-decode + CPU scaling + hwupload + HW encode.
         #
-        # The CPU decodes the video; -hwaccel_device sets up a VAAPI device
-        # context so that the filter graph can reference it for hwupload.
-        # Without -hwaccel_output_format vaapi the decoded frames stay in
-        # system memory, then format=nv12,hwupload sends them to the GPU for
-        # VAAPI encoding.
+        # scale_vaapi hangs on certain codec/driver combinations when the
+        # hardware decoder is active (-hwaccel_output_format vaapi).  Doing
+        # the scale on the CPU and uploading NV12 frames via hwupload avoids
+        # that code path entirely while still using the VAAPI encoder.
         #
-        # Scaling is done on the CPU (scale= filter) BEFORE hwupload to avoid
-        # scale_vaapi, which may hang on some codec/driver combinations.
+        #   -hwaccel vaapi                  try HW decode, fall back to SW
+        #   -hwaccel_device <dev>           gives hwupload a device reference
+        #   scale=w=-2:h=H                  CPU resize, preserves aspect ratio
+        #   format=nv12                     ensure NV12 before upload
+        #   hwupload                        send frames to VAAPI GPU memory
+        #   h264_vaapi                      GPU encoder
         hw_args = ["-hwaccel", "vaapi"]
         if device:
             hw_args += ["-hwaccel_device", device]
-        if job.resolution_height is not None:
-            # scale on CPU → ensure NV12 → upload to VAAPI
-            vf_filter = f"scale=w=-2:h={job.resolution_height},format=nv12,hwupload"
-        else:
-            vf_filter = "format=nv12,hwupload"
-        vf_args = ["-vf", vf_filter]
+        vf_args = ["-vf",
+                   f"scale=w=-2:h={job.resolution_height},format=nv12,hwupload"]
     else:
-        # Hardware-decode → hardware-encode pipeline (fastest, no CPU round-trip).
+        # No scaling → full hardware-decode + hardware-encode pipeline.
         #
-        #   -hwaccel_output_format vaapi  decoder outputs frames already in
-        #                                 VAAPI GPU memory.
-        #   scale_vaapi=w=-2:h=H         GPU-side resize (optional).
-        #   h264_vaapi                    encoder reads directly from GPU.
+        #   -hwaccel_output_format vaapi    decoder leaves frames on GPU
+        #   h264_vaapi                      encoder reads directly from GPU
         #
         # hwupload must NOT be used: frames are already on the GPU.
         hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
         if device:
             hw_args += ["-hwaccel_device", device]
-        if job.resolution_height is not None:
-            vf_args = ["-vf", f"scale_vaapi=w=-2:h={job.resolution_height}"]
-        else:
-            vf_args = []
+        vf_args = []
 
     explicit_map = (
         job.selected_audio     is not None or
@@ -465,16 +459,14 @@ class Encoder:
         on_progress: Callable[[float], None],   # 0.0–1.0
         on_done: Callable[[bool, str], None],   # success, message
     ):
-        """Run encoding in a background thread with automatic sw-decode fallback."""
+        """Run encoding in a background thread."""
         self._cancelled = False
 
         def _run():
             try:
                 fps = get_fps(job.input_path)
                 duration = get_duration(job.input_path)
-
-                # --- Primary attempt: hardware decode + hardware encode ---
-                cmd = build_ffmpeg_cmd(job, fps, software_decode=False)
+                cmd = build_ffmpeg_cmd(job, fps)
                 hung, cancelled, recent = self._run_ffmpeg(cmd, duration, on_progress)
 
                 if cancelled:
@@ -483,47 +475,22 @@ class Encoder:
                     on_done(False, "Abgebrochen")
                     return
 
-                hw_decode_ok = (not hung and self._process.returncode == 0)
-
-                if not hw_decode_ok:
-                    # Clean up any partial output before retrying.
+                if hung:
                     if os.path.exists(job.output_path):
                         os.remove(job.output_path)
+                    on_done(False, f"ffmpeg hängt (kein Fortschritt nach "
+                            f"{WATCHDOG_TIMEOUT}s).")
+                    return
 
-                    if hung:
-                        print("Hardware-decode pipeline hung — retrying with "
-                              "software decode", flush=True)
-                    else:
-                        print(f"Hardware-decode pipeline failed (code "
-                              f"{self._process.returncode}) — retrying with "
-                              f"software decode", flush=True)
-
-                    # --- Fallback: software decode + hardware encode ---
-                    cmd2 = build_ffmpeg_cmd(job, fps, software_decode=True)
-                    hung2, cancelled2, recent = self._run_ffmpeg(
-                        cmd2, duration, on_progress)
-
-                    if cancelled2:
-                        if os.path.exists(job.output_path):
-                            os.remove(job.output_path)
-                        on_done(False, "Abgebrochen")
-                        return
-
-                    if hung2 or self._process.returncode != 0:
-                        if os.path.exists(job.output_path):
-                            os.remove(job.output_path)
-                        if hung2:
-                            on_done(False, "ffmpeg hängt (kein Fortschritt nach "
-                                    f"{WATCHDOG_TIMEOUT}s) — auch Software-Decode "
-                                    "gescheitert.")
-                        else:
-                            error_lines = _filter_error_lines(recent)
-                            detail = ("\n".join(error_lines[-15:])
-                                      if error_lines else "(keine Details)")
-                            on_done(False,
-                                    f"ffmpeg Fehler (Code {self._process.returncode})"
-                                    f" [Software-Decode]\n\n{detail}")
-                        return
+                if self._process.returncode != 0:
+                    if os.path.exists(job.output_path):
+                        os.remove(job.output_path)
+                    error_lines = _filter_error_lines(recent)
+                    detail = ("\n".join(error_lines[-15:])
+                              if error_lines else "(keine Details)")
+                    on_done(False, f"ffmpeg Fehler (Code {self._process.returncode})"
+                            f"\n\n{detail}")
+                    return
 
                 if job.replace_original:
                     os.replace(job.output_path, job.input_path)
