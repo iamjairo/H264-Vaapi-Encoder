@@ -125,24 +125,42 @@ def get_streams(path: str) -> tuple[list[dict], list[dict]]:
     return audio, subtitles
 
 
-def get_bitrate_kbps(path: str) -> Optional[int]:
-    """Return overall file bitrate in kbps via ffprobe, or None on failure.
+def _get_scan_info(path: str) -> tuple[Optional[int], float]:
+    """Return (bitrate_kbps, fps) from a single ffprobe call.
 
-    Only queries the container format header — no decoding, stays fast.
+    Used by scan_folder so that both pieces of information are available
+    without making two separate subprocess calls per file.
     """
+    kbps: Optional[int] = None
+    fps: float = 0.0
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_format", path],
+             "-show_streams", "-show_format", path],
             capture_output=True, text=True, timeout=15,
         )
-        if result.returncode == 0:
-            br = json.loads(result.stdout).get("format", {}).get("bit_rate")
-            if br:
-                return max(1, int(br) // 1000)
+        if result.returncode != 0:
+            return kbps, fps
+        data = json.loads(result.stdout)
+        br = data.get("format", {}).get("bit_rate")
+        if br:
+            kbps = max(1, int(br) // 1000)
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                vbr = stream.get("bit_rate")
+                if vbr:
+                    kbps = max(1, int(vbr) // 1000)   # stream bitrate preferred
+                rfr = stream.get("r_frame_rate", "0/1")
+                try:
+                    num, den = rfr.split("/")
+                    if float(den) != 0:
+                        fps = float(num) / float(den)
+                except Exception:
+                    pass
+                break
     except Exception:
         pass
-    return None
+    return kbps, fps
 
 
 def scan_folder(
@@ -153,7 +171,10 @@ def scan_folder(
     on_found: Callable[[str, int], None],   # (full_path, bitrate_kbps)
     is_cancelled: Callable[[], bool],
 ) -> None:
-    """Recursively scan *folder* for video files whose bitrate > threshold_kbps.
+    """Recursively scan *folder* for video files whose bitrate exceeds the threshold.
+
+    HFR videos (fps >= HIGH_FPS_THRESHOLD) are compared against
+    threshold_kbps * 2, because they will be encoded at double bitrate.
 
     Designed to run in a background thread; all results are delivered via
     the provided callbacks which the caller should route through GLib.idle_add.
@@ -170,8 +191,13 @@ def scan_folder(
         if is_cancelled():
             break
         on_progress(idx, total, found, os.path.basename(path))
-        kbps = get_bitrate_kbps(path)
-        if kbps is not None and kbps > threshold_kbps:
+        kbps, fps = _get_scan_info(path)
+        if kbps is None:
+            continue
+        effective_threshold = (threshold_kbps * 2
+                               if fps >= HIGH_FPS_THRESHOLD
+                               else threshold_kbps)
+        if kbps > effective_threshold:
             found += 1
             on_found(path, kbps)
 
@@ -188,9 +214,11 @@ def get_file_metadata(path: str) -> dict:
       height         – int
       video_kbps     – int | None
       audio_kbps     – int | None  (first audio stream)
+      fps            – float
+      duration_secs  – float
     """
     out = dict(audio=[], subtitles=[], width=0, height=0,
-               video_kbps=None, audio_kbps=None)
+               video_kbps=None, audio_kbps=None, fps=0.0, duration_secs=0.0)
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -207,6 +235,10 @@ def get_file_metadata(path: str) -> dict:
         if raw_br:
             overall_kbps = max(1, int(raw_br) // 1000)
 
+        raw_dur = fmt.get("duration")
+        if raw_dur:
+            out["duration_secs"] = float(raw_dur)
+
         a_idx = s_idx = 0
         for stream in data.get("streams", []):
             ctype = stream.get("codec_type", "")
@@ -221,6 +253,16 @@ def get_file_metadata(path: str) -> dict:
                 vbr = stream.get("bit_rate")
                 if vbr:
                     out["video_kbps"] = max(1, int(vbr) // 1000)
+                rfr = stream.get("r_frame_rate", "0/1")
+                try:
+                    num, den = rfr.split("/")
+                    if float(den) != 0:
+                        out["fps"] = float(num) / float(den)
+                except Exception:
+                    pass
+                dur = stream.get("duration")
+                if dur:
+                    out["duration_secs"] = float(dur)
             elif ctype == "audio":
                 abr = stream.get("bit_rate")
                 if abr and out["audio_kbps"] is None:

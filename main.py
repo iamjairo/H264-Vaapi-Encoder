@@ -65,6 +65,8 @@ COL_SUB_LABEL   = 6
 COL_RESOLUTION  = 7   # e.g. "1920×1080"
 COL_VID_BITRATE = 8   # e.g. "4.3 Mbps"
 COL_AUD_BITRATE = 9   # e.g. "128 kbps"
+COL_FPS         = 10  # e.g. "59.94"
+COL_DURATION    = 11  # e.g. "1:23:45"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,24 @@ def _fmt_kbps(kbps: int | None) -> str:
 
 def _fmt_resolution(w: int, h: int) -> str:
     return f"{w}×{h}" if w and h else "–"
+
+
+def _fmt_fps(fps: float) -> str:
+    if fps <= 0:
+        return "–"
+    # Show decimal only when it's not a whole number
+    return f"{fps:.2f}".rstrip("0").rstrip(".") + " fps"
+
+
+def _fmt_duration(secs: float) -> str:
+    if secs <= 0:
+        return "–"
+    total = int(secs)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 STATUS_PENDING  = "Ausstehend"
 STATUS_ENCODING = "Wird kodiert…"
@@ -230,29 +250,31 @@ class MainWindow(Gtk.Window):
         # filename, directory, status, progress, full-path,
         # audio-label, sub-label, resolution, vid-bitrate, aud-bitrate
         self._store = Gtk.ListStore(str, str, str, int, str,
-                                    str, str, str, str, str)
+                                    str, str, str, str, str,
+                                    str, str)   # COL_FPS, COL_DURATION
 
         tv = Gtk.TreeView(model=self._store)
         tv.set_reorderable(True)
         tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self._treeview = tv
 
-        def col(title, idx, expand=False):
+        def col(title, idx):
             cell = Gtk.CellRendererText()
             cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
             c = Gtk.TreeViewColumn(title, cell, text=idx)
-            c.set_expand(expand)
+            c.set_expand(True)
             c.set_resizable(True)
             tv.append_column(c)
 
-        col("Dateiname",  COL_FILENAME,  expand=True)
-        col("Verzeichnis", COL_DIRECTORY, expand=False)
-        col("Status",     COL_STATUS)
+        col("Dateiname",   COL_FILENAME)
+        col("Verzeichnis", COL_DIRECTORY)
+        col("Status",      COL_STATUS)
 
         # Progress column
         prog_cell = Gtk.CellRendererProgress()
         prog_col = Gtk.TreeViewColumn("Fortschritt", prog_cell, value=COL_PROGRESS)
-        prog_col.set_min_width(100)
+        prog_col.set_expand(True)
+        prog_col.set_resizable(True)
         tv.append_column(prog_col)
 
         # Audio tracks column (clickable summary)
@@ -261,7 +283,8 @@ class MainWindow(Gtk.Window):
         audio_cell.set_property("underline", Pango.Underline.SINGLE)
         self._col_audio = Gtk.TreeViewColumn("Audiospuren", audio_cell,
                                              text=COL_AUDIO_LABEL)
-        self._col_audio.set_min_width(90)
+        self._col_audio.set_expand(True)
+        self._col_audio.set_resizable(True)
         tv.append_column(self._col_audio)
 
         # Subtitle tracks column (clickable summary)
@@ -270,22 +293,25 @@ class MainWindow(Gtk.Window):
         sub_cell.set_property("underline", Pango.Underline.SINGLE)
         self._col_sub = Gtk.TreeViewColumn("Untertitel", sub_cell,
                                            text=COL_SUB_LABEL)
-        self._col_sub.set_min_width(80)
+        self._col_sub.set_expand(True)
+        self._col_sub.set_resizable(True)
         tv.append_column(self._col_sub)
 
         tv.connect("button-press-event", self._on_treeview_button_press)
 
-        def _right_col(title, col_idx, min_w=80):
+        def _right_col(title, col_idx):
             cell = Gtk.CellRendererText()
             cell.set_property("xalign", 1.0)
             c = Gtk.TreeViewColumn(title, cell, text=col_idx)
-            c.set_min_width(min_w)
+            c.set_expand(True)
             c.set_resizable(True)
             tv.append_column(c)
 
-        _right_col("Auflösung",    COL_RESOLUTION,  90)
-        _right_col("Video-Bitrate", COL_VID_BITRATE, 90)
-        _right_col("Audio-Bitrate", COL_AUD_BITRATE, 80)
+        _right_col("Auflösung",    COL_RESOLUTION)
+        _right_col("Video-Bitrate", COL_VID_BITRATE)
+        _right_col("Audio-Bitrate", COL_AUD_BITRATE)
+        _right_col("FPS",           COL_FPS)
+        _right_col("Länge",         COL_DURATION)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -709,8 +735,8 @@ class MainWindow(Gtk.Window):
                     STATUS_PENDING,
                     0,
                     path,
-                    "Lädt…", "Lädt…",   # audio / sub labels
-                    "–", "–", "–",      # resolution / vid-br / aud-br
+                    "Lädt…", "Lädt…",         # audio / sub labels
+                    "–", "–", "–", "–", "–",  # resolution / vid-br / aud-br / fps / duration
                 ])
             ),
         )
@@ -734,6 +760,10 @@ class MainWindow(Gtk.Window):
                                          _fmt_kbps(meta["video_kbps"]))
                     self._store.set_value(it, COL_AUD_BITRATE,
                                          _fmt_kbps(meta["audio_kbps"]))
+                    self._store.set_value(it, COL_FPS,
+                                         _fmt_fps(meta["fps"]))
+                    self._store.set_value(it, COL_DURATION,
+                                         _fmt_duration(meta["duration_secs"]))
                 return False
 
             GLib.idle_add(_apply)
