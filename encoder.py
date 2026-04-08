@@ -307,22 +307,23 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     device = find_vaapi_device()
 
     if job.resolution_height is not None:
-        # Scaling needed → software-decode + CPU scaling + hwupload + HW encode.
+        # Scaling needed → pure software decode + CPU scaling + hwupload + HW encode.
         #
-        # scale_vaapi hangs on certain codec/driver combinations when the
-        # hardware decoder is active (-hwaccel_output_format vaapi).  Doing
-        # the scale on the CPU and uploading NV12 frames via hwupload avoids
-        # that code path entirely while still using the VAAPI encoder.
+        # -init_hw_device vaapi=va:<dev>   create a named VAAPI device
+        # -filter_hw_device va             give hwupload a device reference
+        # scale=w=-2:h=H                   CPU resize (avoids scale_vaapi hang)
+        # format=nv12                       ensure NV12 before upload
+        # hwupload                          send frames to VAAPI GPU memory
+        # h264_vaapi                        GPU encoder
         #
-        #   -hwaccel vaapi                  try HW decode, fall back to SW
-        #   -hwaccel_device <dev>           gives hwupload a device reference
-        #   scale=w=-2:h=H                  CPU resize, preserves aspect ratio
-        #   format=nv12                     ensure NV12 before upload
-        #   hwupload                        send frames to VAAPI GPU memory
-        #   h264_vaapi                      GPU encoder
-        hw_args = ["-hwaccel", "vaapi"]
+        # Note: no -hwaccel flags here; the device ref comes from
+        # -filter_hw_device, not from the decoder context.
         if device:
-            hw_args += ["-hwaccel_device", device]
+            hw_args = ["-init_hw_device", f"vaapi=va:{device}",
+                       "-filter_hw_device", "va"]
+        else:
+            hw_args = ["-init_hw_device", "vaapi=va",
+                       "-filter_hw_device", "va"]
         vf_args = ["-vf",
                    f"scale=w=-2:h={job.resolution_height},format=nv12,hwupload"]
     else:
