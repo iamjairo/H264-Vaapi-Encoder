@@ -8,6 +8,10 @@ from urllib.parse import unquote
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, GObject, Pango
+import subprocess
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf
+from typing import Optional
 
 from encoder import (
     Encoder, EncodeJob,
@@ -166,6 +170,8 @@ class MainWindow(Gtk.Window):
         self._encoding_active = False
         self._file_streams: dict[str, tuple[list, list]] = {}
         self._completed: set[str] = set()   # successfully encoded paths
+        self._file_rotations: dict[str, int] = {}  # path → rotation degrees
+        self._preview_path: Optional[str] = None    # currently previewed path
 
         self._build_ui()
         self._restore_queue()
@@ -227,8 +233,12 @@ class MainWindow(Gtk.Window):
 
         # Left: file list
         paned.pack1(self._build_file_list(), True, True)
-        # Right: settings
-        paned.pack2(self._build_settings(), False, False)
+        # Right: settings + preview (vertical split)
+        right_pane = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        right_pane.pack1(self._build_settings(), True, True)
+        right_pane.pack2(self._build_preview_panel(), False, False)
+        right_pane.set_position(380)
+        paned.pack2(right_pane, False, False)
 
         # ---- Status bar ------------------------------------------------
         status_box = Gtk.Box(spacing=8)
@@ -247,11 +257,12 @@ class MainWindow(Gtk.Window):
         frame = Gtk.Frame(label="Eingabedateien")
         frame.set_shadow_type(Gtk.ShadowType.IN)
 
-        # filename, directory, status, progress, full-path,
-        # audio-label, sub-label, resolution, vid-bitrate, aud-bitrate
+        # columns: filename, directory, status, progress, full-path,
+        #          audio-label(hidden), sub-label(hidden),
+        #          resolution, vid-bitrate, aud-bitrate, fps, duration
         self._store = Gtk.ListStore(str, str, str, int, str,
                                     str, str, str, str, str,
-                                    str, str)   # COL_FPS, COL_DURATION
+                                    str, str)
 
         tv = Gtk.TreeView(model=self._store)
         tv.set_reorderable(True)
@@ -277,28 +288,6 @@ class MainWindow(Gtk.Window):
         prog_col.set_resizable(True)
         tv.append_column(prog_col)
 
-        # Audio tracks column (clickable summary)
-        audio_cell = Gtk.CellRendererText()
-        audio_cell.set_property("foreground", "#2266cc")
-        audio_cell.set_property("underline", Pango.Underline.SINGLE)
-        self._col_audio = Gtk.TreeViewColumn("Audiospuren", audio_cell,
-                                             text=COL_AUDIO_LABEL)
-        self._col_audio.set_expand(True)
-        self._col_audio.set_resizable(True)
-        tv.append_column(self._col_audio)
-
-        # Subtitle tracks column (clickable summary)
-        sub_cell = Gtk.CellRendererText()
-        sub_cell.set_property("foreground", "#2266cc")
-        sub_cell.set_property("underline", Pango.Underline.SINGLE)
-        self._col_sub = Gtk.TreeViewColumn("Untertitel", sub_cell,
-                                           text=COL_SUB_LABEL)
-        self._col_sub.set_expand(True)
-        self._col_sub.set_resizable(True)
-        tv.append_column(self._col_sub)
-
-        tv.connect("button-press-event", self._on_treeview_button_press)
-
         def _right_col(title, col_idx):
             cell = Gtk.CellRendererText()
             cell.set_property("xalign", 1.0)
@@ -312,6 +301,10 @@ class MainWindow(Gtk.Window):
         _right_col("Audio-Bitrate", COL_AUD_BITRATE)
         _right_col("FPS",           COL_FPS)
         _right_col("Länge",         COL_DURATION)
+
+        tv.connect("button-press-event", self._on_treeview_button_press)
+        tv.connect("row-activated",      self._on_row_activated)
+        tv.get_selection().connect("changed", self._on_selection_changed)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -459,6 +452,29 @@ class MainWindow(Gtk.Window):
         outer.pack_end(Gtk.Box(), True, True, 0)  # spacer
         return outer
 
+    def _build_preview_panel(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Vorschau")
+        frame.set_shadow_type(Gtk.ShadowType.IN)
+        frame.set_size_request(-1, 230)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_vexpand(True)
+
+        self._preview_image = Gtk.Image()
+        self._preview_image.set_no_show_all(True)
+
+        self._preview_label = Gtk.Label()
+        self._preview_label.set_markup("<i>Kein Video ausgewählt</i>")
+        self._preview_label.set_sensitive(False)
+
+        box.pack_start(self._preview_image, False, False, 0)
+        box.pack_start(self._preview_label, False, False, 0)
+
+        frame.add(box)
+        return frame
+
     # ------------------------------------------------------------------
     # Signal Handlers
     # ------------------------------------------------------------------
@@ -520,6 +536,7 @@ class MainWindow(Gtk.Window):
             if full in self._queue:
                 self._queue.remove(full)
             self._file_streams.pop(full, None)
+            self._file_rotations.pop(full, None)
             self._completed.discard(full)
             model.remove(it)
         self._save_queue()
@@ -621,6 +638,7 @@ class MainWindow(Gtk.Window):
                     resolution_height=resolution_height,
                     selected_audio=sel_audio_arg,
                     selected_subtitles=sel_subs_arg,
+                    rotation=self._file_rotations.get(path, 0),
                 )
             )
 
@@ -861,66 +879,194 @@ class MainWindow(Gtk.Window):
         self._store.set_value(it, COL_AUDIO_LABEL, self._stream_summary(audio))
         self._store.set_value(it, COL_SUB_LABEL,   self._stream_summary(subs))
 
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
+
+    def _on_selection_changed(self, selection):
+        model, paths = selection.get_selected_rows()
+        if len(paths) == 1:
+            it = model.get_iter(paths[0])
+            path = model.get_value(it, COL_FULLPATH)
+            self._show_preview(path)
+        else:
+            self._clear_preview()
+
+    def _show_preview(self, path: str):
+        if self._preview_path == path:
+            return
+        self._preview_path = path
+        self._preview_label.show()
+        self._preview_image.hide()
+        self._preview_label.set_markup("<i>Lädt Vorschau…</i>")
+
+        def _load():
+            pixbuf = self._extract_thumbnail(path, max_w=580, max_h=220)
+            def _apply():
+                if self._preview_path != path:
+                    return False   # selection changed while loading
+                if pixbuf:
+                    self._preview_image.set_from_pixbuf(pixbuf)
+                    self._preview_image.show()
+                    self._preview_label.hide()
+                else:
+                    self._preview_label.set_markup("<i>Vorschau nicht verfügbar</i>")
+                return False
+            GLib.idle_add(_apply)
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _clear_preview(self):
+        self._preview_path = None
+        self._preview_image.hide()
+        self._preview_label.show()
+        self._preview_label.set_markup("<i>Kein Video ausgewählt</i>")
+
+    @staticmethod
+    def _extract_thumbnail(path: str, max_w: int = 580, max_h: int = 220):
+        """Return a GdkPixbuf thumbnail or None on failure."""
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-ss", "00:00:05", "-i", path,
+                 "-vframes", "1",
+                 "-vf", f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease",
+                 "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
+                capture_output=True, timeout=15,
+            )
+            if result.returncode == 0 and result.stdout:
+                loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+                loader.write(result.stdout)
+                loader.close()
+                return loader.get_pixbuf()
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
+    # Play / Context menu
+    # ------------------------------------------------------------------
+
+    def _on_row_activated(self, treeview, tree_path, column):
+        """Double-click: open file with default video player."""
+        it = self._store.get_iter(tree_path)
+        path = self._store.get_value(it, COL_FULLPATH)
+        self._play_file(path)
+
+    @staticmethod
+    def _play_file(path: str):
+        try:
+            subprocess.Popen(["xdg-open", path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
     def _on_treeview_button_press(self, widget, event):
-        """Open a stream-selection popover when the audio/subtitle column is clicked."""
-        if event.button != 1:
+        """Right-click → context menu."""
+        from gi.repository import Gdk
+        if event.button != 3:
             return False
         result = widget.get_path_at_pos(int(event.x), int(event.y))
         if result is None:
             return False
-        tree_path, column, _cx, _cy = result
-        if column is self._col_audio:
-            self._show_stream_popover(widget, tree_path, "audio")
-            return True
-        if column is self._col_sub:
-            self._show_stream_popover(widget, tree_path, "subtitle")
-            return True
-        return False
-
-    def _show_stream_popover(self, treeview, tree_path, stype: str):
-        it        = self._store.get_iter(tree_path)
+        tree_path, _col, _cx, _cy = result
+        # Ensure the right-clicked row is selected
+        sel = widget.get_selection()
+        if not sel.path_is_selected(tree_path):
+            sel.unselect_all()
+            sel.select_path(tree_path)
+        it = self._store.get_iter(tree_path)
         file_path = self._store.get_value(it, COL_FULLPATH)
+        self._show_context_menu(widget, event, tree_path, file_path)
+        return True
+
+    def _show_context_menu(self, treeview, event, tree_path, file_path: str):
+        menu = Gtk.Menu()
+        menu.attach_to_widget(treeview, None)
+
+        # ---- Play -------------------------------------------------------
+        item_play = Gtk.MenuItem(label="▶  Abspielen")
+        item_play.connect("activate", lambda _: self._play_file(file_path))
+        menu.append(item_play)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # ---- Audio tracks -----------------------------------------------
         audio, subs = self._file_streams.get(file_path, ([], []))
-        streams   = audio if stype == "audio" else subs
-        col       = self._col_audio if stype == "audio" else self._col_sub
-        title_str = "Audiospuren" if stype == "audio" else "Untertitel"
 
-        popover = Gtk.Popover()
-        popover.set_relative_to(treeview)
-        cell_rect = treeview.get_cell_area(tree_path, col)
-        popover.set_pointing_to(cell_rect)
-
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        outer.set_border_width(10)
-
-        hdr = Gtk.Label()
-        hdr.set_markup(f"<b>{title_str}</b>")
-        hdr.set_halign(Gtk.Align.START)
-        outer.pack_start(hdr, False, False, 0)
-
-        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        outer.pack_start(sep, False, False, 2)
-
-        if not streams:
-            lbl = Gtk.Label(label="Keine Spuren gefunden.")
-            lbl.set_sensitive(False)
-            outer.pack_start(lbl, False, False, 0)
-        else:
-            for stream in streams:
-                label = self._stream_label(stream, stype)
-                chk   = Gtk.CheckButton(label=label)
+        audio_item = Gtk.MenuItem(label="Audiospuren")
+        if audio:
+            audio_sub = Gtk.Menu()
+            for stream in audio:
+                label = self._stream_label(stream, "audio")
+                chk = Gtk.CheckMenuItem(label=label)
                 chk.set_active(stream["enabled"])
+                chk.connect("toggled", lambda btn, s=stream, fp=file_path, tp=tree_path:
+                            self._on_stream_toggle(btn, s, fp, tp))
+                audio_sub.append(chk)
+            audio_item.set_submenu(audio_sub)
+        else:
+            audio_item.set_sensitive(False)
+        menu.append(audio_item)
 
-                def _on_toggle(btn, s=stream, fp=file_path, tp=tree_path):
-                    s["enabled"] = btn.get_active()
-                    self._update_stream_summary(fp, tp)
+        # ---- Subtitle tracks --------------------------------------------
+        sub_item = Gtk.MenuItem(label="Untertitel")
+        if subs:
+            sub_menu = Gtk.Menu()
+            for stream in subs:
+                label = self._stream_label(stream, "subtitle")
+                chk = Gtk.CheckMenuItem(label=label)
+                chk.set_active(stream["enabled"])
+                chk.connect("toggled", lambda btn, s=stream, fp=file_path, tp=tree_path:
+                            self._on_stream_toggle(btn, s, fp, tp))
+                sub_menu.append(chk)
+            sub_item.set_submenu(sub_menu)
+        else:
+            sub_item.set_sensitive(False)
+        menu.append(sub_item)
 
-                chk.connect("toggled", _on_toggle)
-                outer.pack_start(chk, False, False, 0)
+        menu.append(Gtk.SeparatorMenuItem())
 
-        popover.add(outer)
-        popover.show_all()
-        popover.popup()
+        # ---- Rotation ---------------------------------------------------
+        rot_item = Gtk.MenuItem(label="Drehung")
+        rot_menu = Gtk.Menu()
+
+        current_rot = self._file_rotations.get(file_path, 0)
+
+        r_none = Gtk.RadioMenuItem(label="Keine Drehung")
+        r_none.set_active(current_rot == 0)
+        rot_menu.append(r_none)
+
+        r_cw = Gtk.RadioMenuItem.new_with_label_from_widget(r_none, "90° im Uhrzeigersinn")
+        r_cw.set_active(current_rot == 90)
+        rot_menu.append(r_cw)
+
+        r_ccw = Gtk.RadioMenuItem.new_with_label_from_widget(r_none, "90° gegen Uhrzeigersinn")
+        r_ccw.set_active(current_rot == -90)
+        rot_menu.append(r_ccw)
+
+        def _on_rot(btn, deg, fp=file_path):
+            if btn.get_active():
+                self._file_rotations[fp] = deg
+
+        r_none.connect("toggled", _on_rot, 0)
+        r_cw.connect("toggled",   _on_rot, 90)
+        r_ccw.connect("toggled",  _on_rot, -90)
+
+        rot_item.set_submenu(rot_menu)
+        menu.append(rot_item)
+
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _on_stream_toggle(self, btn, stream: dict, file_path: str, tree_path):
+        stream["enabled"] = btn.get_active()
+        # Update the hidden label columns so _update_stream_summary still works
+        it = self._store.get_iter(tree_path)
+        if it:
+            audio, subs = self._file_streams.get(file_path, ([], []))
+            self._store.set_value(it, COL_AUDIO_LABEL, self._stream_summary(audio))
+            self._store.set_value(it, COL_SUB_LABEL,   self._stream_summary(subs))
 
     def _show_error(self, message: str):
         dlg = Gtk.MessageDialog(

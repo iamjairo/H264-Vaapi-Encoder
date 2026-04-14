@@ -27,6 +27,7 @@ class EncodeJob:
     resolution_height: Optional[int] = None      # None = keep original
     selected_audio: Optional[list[int]] = None   # rel. indices; None = all
     selected_subtitles: Optional[list[int]] = None  # rel. indices; None = none
+    rotation: int = 0  # 0 = none, 90 = clockwise, -90 = counter-clockwise
 
 
 def probe_video(path: str) -> dict:
@@ -348,33 +349,31 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
 
     device = find_vaapi_device()
 
-    if job.resolution_height is not None:
-        # Scaling needed → pure software decode + CPU scaling + hwupload + HW encode.
-        #
-        # -init_hw_device vaapi=va:<dev>   create a named VAAPI device
-        # -filter_hw_device va             give hwupload a device reference
-        # scale=w=-2:h=H                   CPU resize (avoids scale_vaapi hang)
-        # format=nv12                       ensure NV12 before upload
-        # hwupload                          send frames to VAAPI GPU memory
-        # h264_vaapi                        GPU encoder
-        #
-        # Note: no -hwaccel flags here; the device ref comes from
-        # -filter_hw_device, not from the decoder context.
+    # Use the software-decode pipeline when scaling OR rotation is needed.
+    # The HW-decode pipeline (hwaccel_output_format vaapi) only supports
+    # passthrough – it cannot apply CPU-side transpose or scale.
+    needs_sw = job.resolution_height is not None or job.rotation != 0
+
+    if needs_sw:
+        # Pure software decode + CPU filters + hwupload + HW encode.
+        # -init_hw_device / -filter_hw_device give hwupload a device ref.
         if device:
             hw_args = ["-init_hw_device", f"vaapi=va:{device}",
                        "-filter_hw_device", "va"]
         else:
             hw_args = ["-init_hw_device", "vaapi=va",
                        "-filter_hw_device", "va"]
-        vf_args = ["-vf",
-                   f"scale=w=-2:h={job.resolution_height},format=nv12,hwupload"]
+        filters: list[str] = []
+        if job.rotation == 90:
+            filters.append("transpose=1")       # 90° clockwise
+        elif job.rotation == -90:
+            filters.append("transpose=2")       # 90° counter-clockwise
+        if job.resolution_height is not None:
+            filters.append(f"scale=w=-2:h={job.resolution_height}")
+        filters += ["format=nv12", "hwupload"]
+        vf_args = ["-vf", ",".join(filters)]
     else:
-        # No scaling → full hardware-decode + hardware-encode pipeline.
-        #
-        #   -hwaccel_output_format vaapi    decoder leaves frames on GPU
-        #   h264_vaapi                      encoder reads directly from GPU
-        #
-        # hwupload must NOT be used: frames are already on the GPU.
+        # No scaling, no rotation → full HW-decode pipeline.
         hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
         if device:
             hw_args += ["-hwaccel_device", device]
