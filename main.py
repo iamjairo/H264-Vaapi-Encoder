@@ -8,7 +8,7 @@ import gi
 from urllib.parse import unquote
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib, GObject, Pango
+from gi.repository import Gtk, Gdk, GLib, GObject, Pango
 import subprocess
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf
@@ -278,7 +278,20 @@ class MainWindow(Gtk.Window):
         tv = Gtk.TreeView(model=self._store)
         tv.set_reorderable(True)
         tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        tv.set_grid_lines(Gtk.TreeViewGridLines.VERTICAL)
         self._treeview = tv
+
+        # Make the progress-bar percentage text readable in black,
+        # and draw light vertical column separators.
+        _css = b"""
+            treeview progress { color: #000000; }
+            treeview { -GtkTreeView-grid-line-width: 1; }
+        """
+        _prov = Gtk.CssProvider()
+        _prov.load_from_data(_css)
+        tv.get_style_context().add_provider(
+            _prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
         def col(title, idx):
             cell = Gtk.CellRendererText()
@@ -332,7 +345,6 @@ class MainWindow(Gtk.Window):
 
         # Drag-and-drop target
         try:
-            from gi.repository import Gdk
             tv.drag_dest_set(
                 Gtk.DestDefaults.ALL,
                 [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
@@ -1062,9 +1074,38 @@ class MainWindow(Gtk.Window):
         except Exception:
             pass
 
+    @staticmethod
+    def _show_in_folder(path: str):
+        """Open the parent folder in the default file manager with the file selected."""
+        import urllib.parse
+        uri = "file://" + urllib.parse.quote(path)
+        try:
+            # org.freedesktop.FileManager1 is supported by Nautilus, Dolphin,
+            # Thunar, Nemo and others — selects the file in the open window.
+            subprocess.Popen(
+                [
+                    "dbus-send", "--session",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    f"array:string:{uri}",
+                    "string:",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            # Fallback: just open the directory
+            try:
+                subprocess.Popen(["xdg-open", os.path.dirname(path)],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
     def _on_treeview_button_press(self, widget, event):
         """Right-click → context menu."""
-        from gi.repository import Gdk
         if event.button != 3:
             return False
         result = widget.get_path_at_pos(int(event.x), int(event.y))
@@ -1086,10 +1127,14 @@ class MainWindow(Gtk.Window):
         menu.attach_to_widget(treeview, None)
         fs = self._file_settings.get(file_path, {})
 
-        # ---- Play -------------------------------------------------------
+        # ---- Play / Show in folder --------------------------------------
         item_play = Gtk.MenuItem(label="▶  Abspielen")
         item_play.connect("activate", lambda _: self._play_file(file_path))
         menu.append(item_play)
+
+        item_folder = Gtk.MenuItem(label="📂  Im Ordner ansehen")
+        item_folder.connect("activate", lambda _: self._show_in_folder(file_path))
+        menu.append(item_folder)
 
         menu.append(Gtk.SeparatorMenuItem())
 
