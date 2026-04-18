@@ -460,6 +460,24 @@ class MainWindow(Gtk.Window):
         note.set_halign(Gtk.Align.START)
         br_grid.attach(note, 0, 5, 2, 1)
 
+        # ---- Post-encoding action --------------------------------------
+        action_frame = Gtk.Frame(label="Aktion nach Kodierung")
+        action_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        action_box.set_border_width(8)
+        action_frame.add(action_box)
+
+        self._radio_action_nothing = Gtk.RadioButton.new_with_label(
+            None, "Nichts tun")
+        self._radio_action_quit = Gtk.RadioButton.new_with_label_from_widget(
+            self._radio_action_nothing, "Programm schließen")
+        self._radio_action_shutdown = Gtk.RadioButton.new_with_label_from_widget(
+            self._radio_action_nothing, "Computer herunterfahren")
+
+        action_box.pack_start(self._radio_action_nothing,  False, False, 0)
+        action_box.pack_start(self._radio_action_quit,     False, False, 0)
+        action_box.pack_start(self._radio_action_shutdown, False, False, 0)
+
+        outer.pack_start(action_frame, False, False, 0)
         outer.pack_end(Gtk.Box(), True, True, 0)  # spacer
         return outer
 
@@ -756,6 +774,11 @@ class MainWindow(Gtk.Window):
         self._btn_cancel.set_sensitive(False)
         self._global_progress.set_fraction(1.0)
         self._status_label.set_text("Alle Aufgaben abgeschlossen.")
+
+        if self._radio_action_quit.get_active():
+            Gtk.main_quit()
+        elif self._radio_action_shutdown.get_active():
+            subprocess.Popen(["systemctl", "poweroff"])
 
     # ------------------------------------------------------------------
     # Helpers
