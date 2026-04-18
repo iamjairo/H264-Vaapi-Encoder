@@ -281,16 +281,25 @@ class MainWindow(Gtk.Window):
         tv.set_grid_lines(Gtk.TreeViewGridLines.VERTICAL)
         self._treeview = tv
 
-        # Make the progress-bar percentage text readable in black,
-        # and draw light vertical column separators.
+        # Progress-bar percentage in black; light 1 px column separators.
+        # Must be applied to the screen so child CSS nodes (progress, separator)
+        # actually inherit the rules — adding to the widget node alone is not
+        # enough in GTK3.
         _css = b"""
-            treeview progress { color: #000000; }
-            treeview { -GtkTreeView-grid-line-width: 1; }
+            treeview progress {
+                color: #000000;
+            }
+            treeview {
+                -GtkTreeView-grid-line-width: 1;
+                border-color: alpha(white, 0.15);
+            }
         """
         _prov = Gtk.CssProvider()
         _prov.load_from_data(_css)
-        tv.get_style_context().add_provider(
-            _prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            _prov,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
         def col(title, idx):
