@@ -174,15 +174,18 @@ class ProgressCellRenderer(Gtk.CellRendererProgress):
     __gtype_name__ = "ProgressCellRenderer"
 
     def do_render(self, cr, widget, background_area, cell_area, flags):
-        text = self.props.text or ""
-        self.props.text = ""                    # suppress built-in text
+        saved = self.props.text          # None when only "value" is bound
+        self.props.text = ""             # suppress built-in text so bar draws clean
         Gtk.CellRendererProgress.do_render(
             self, cr, widget, background_area, cell_area, flags)
-        self.props.text = text
+        self.props.text = saved
 
-        if not text:
+        # When text is None the C code auto-formats "N %"; mirror that here.
+        label = saved if saved is not None else f"{self.props.value}\u202f%"
+        if not label:
             return
-        layout = widget.create_pango_layout(text)
+
+        layout = widget.create_pango_layout(label)
         lw, lh = layout.get_pixel_size()
         tx = cell_area.x + (cell_area.width  - lw) / 2
         ty = cell_area.y + (cell_area.height - lh) / 2
