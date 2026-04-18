@@ -163,7 +163,7 @@ QUEUE_FILE = os.path.join(
 class MainWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="H264 VAAPI Encoder")
-        self.set_default_size(1150, 640)
+        self.set_default_size(1200, 800)
         self.set_border_width(0)
         self.connect("delete-event", self._on_close)
 
@@ -239,10 +239,14 @@ class MainWindow(Gtk.Window):
         # Left: file list
         paned.pack1(self._build_file_list(), True, True)
         # Right: settings + preview (vertical split)
+        settings_scroll = Gtk.ScrolledWindow()
+        settings_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        settings_scroll.add(self._build_settings())
+
         right_pane = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
-        right_pane.pack1(self._build_settings(), True, True)
+        right_pane.pack1(settings_scroll, True, True)
         right_pane.pack2(self._build_preview_panel(), False, False)
-        right_pane.set_position(380)
+        right_pane.set_position(560)
         paned.pack2(right_pane, False, False)
 
         # ---- Status bar ------------------------------------------------
