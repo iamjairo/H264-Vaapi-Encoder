@@ -293,19 +293,20 @@ class MainWindow(Gtk.Window):
         prog_col.set_resizable(True)
         tv.append_column(prog_col)
 
-        def _right_col(title, col_idx):
+        def _auto_col(title, col_idx):
+            """Metadata column: auto-sized to content, no extra expand."""
             cell = Gtk.CellRendererText()
             cell.set_property("xalign", 1.0)
             c = Gtk.TreeViewColumn(title, cell, text=col_idx)
-            c.set_expand(True)
+            c.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
             c.set_resizable(True)
             tv.append_column(c)
 
-        _right_col("Auflösung",    COL_RESOLUTION)
-        _right_col("Video-Bitrate", COL_VID_BITRATE)
-        _right_col("Audio-Bitrate", COL_AUD_BITRATE)
-        _right_col("FPS",           COL_FPS)
-        _right_col("Länge",         COL_DURATION)
+        _auto_col("Auflösung",    COL_RESOLUTION)
+        _auto_col("Video-Bitrate", COL_VID_BITRATE)
+        _auto_col("Audio-Bitrate", COL_AUD_BITRATE)
+        _auto_col("FPS",           COL_FPS)
+        _auto_col("Länge",         COL_DURATION)
 
         tv.connect("button-press-event", self._on_treeview_button_press)
         tv.connect("row-activated",      self._on_row_activated)
