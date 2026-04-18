@@ -22,12 +22,13 @@ class EncodeJob:
     input_path: str
     output_path: str
     video_bitrate: str
-    audio_bitrate: str
+    audio_bitrate: Optional[str]  # None = stream-copy audio
     replace_original: bool
     resolution_height: Optional[int] = None      # None = keep original
     selected_audio: Optional[list[int]] = None   # rel. indices; None = all
     selected_subtitles: Optional[list[int]] = None  # rel. indices; None = none
     rotation: int = 0  # 0 = none, 90 = clockwise, -90 = counter-clockwise
+    fps_limit: Optional[int] = None  # None = keep original fps
 
 
 def probe_video(path: str) -> dict:
@@ -342,17 +343,23 @@ def _double_bitrate(bitrate_str: str) -> str:
 
 def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
     video_bitrate = job.video_bitrate
-    audio_bitrate = job.audio_bitrate
 
-    if fps >= HIGH_FPS_THRESHOLD:
+    # Applying an fps_limit means we're converting away from HFR, so
+    # the bitrate should NOT be doubled.
+    needs_fps_filter = (
+        job.fps_limit is not None and fps > job.fps_limit
+    )
+    if fps >= HIGH_FPS_THRESHOLD and not needs_fps_filter:
         video_bitrate = _double_bitrate(video_bitrate)
 
     device = find_vaapi_device()
 
-    # Use the software-decode pipeline when scaling OR rotation is needed.
-    # The HW-decode pipeline (hwaccel_output_format vaapi) only supports
-    # passthrough – it cannot apply CPU-side transpose or scale.
-    needs_sw = job.resolution_height is not None or job.rotation != 0
+    # SW-decode pipeline whenever any CPU-side filter is needed.
+    needs_sw = (
+        job.resolution_height is not None
+        or job.rotation != 0
+        or needs_fps_filter
+    )
 
     if needs_sw:
         # Pure software decode + CPU filters + hwupload + HW encode.
@@ -365,19 +372,27 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
                        "-filter_hw_device", "va"]
         filters: list[str] = []
         if job.rotation == 90:
-            filters.append("transpose=1")       # 90° clockwise
+            filters.append("transpose=1")
         elif job.rotation == -90:
-            filters.append("transpose=2")       # 90° counter-clockwise
+            filters.append("transpose=2")
+        if needs_fps_filter:
+            filters.append(f"fps={job.fps_limit}")
         if job.resolution_height is not None:
             filters.append(f"scale=w=-2:h={job.resolution_height}")
         filters += ["format=nv12", "hwupload"]
         vf_args = ["-vf", ",".join(filters)]
     else:
-        # No scaling, no rotation → full HW-decode pipeline.
+        # No scaling, no rotation, no fps filter → full HW-decode pipeline.
         hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
         if device:
             hw_args += ["-hwaccel_device", device]
         vf_args = []
+
+    # Audio: None = stream-copy (original), string = encode to AAC.
+    if job.audio_bitrate is None:
+        audio_args = ["-c:a", "copy"]
+    else:
+        audio_args = ["-c:a", "aac", "-b:a", job.audio_bitrate]
 
     explicit_map = (
         job.selected_audio     is not None or
@@ -393,13 +408,7 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
         for idx in (job.selected_subtitles or []):
             cmd += ["-map", f"0:s:{idx}"]
 
-    cmd += [
-        *vf_args,
-        "-c:v", "h264_vaapi",
-        "-b:v", video_bitrate,
-        "-c:a", "aac",
-        "-b:a", audio_bitrate,
-    ]
+    cmd += [*vf_args, "-c:v", "h264_vaapi", "-b:v", video_bitrate, *audio_args]
 
     if explicit_map and job.selected_subtitles:
         cmd += ["-c:s", "mov_text"]

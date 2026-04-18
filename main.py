@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """H264 VAAPI Encoder – GTK3 GUI"""
 
+import json
 import os
 import threading
 import gi
@@ -36,6 +37,7 @@ VIDEO_BITRATES = [
 ]
 
 AUDIO_BITRATES = [
+    ("Original (beibehalten)", None),   # stream-copy audio
     ("64 kbps",  "64k"),
     ("96 kbps",  "96k"),
     ("128 kbps", "128k"),
@@ -45,7 +47,7 @@ AUDIO_BITRATES = [
 ]
 
 DEFAULT_VIDEO_IDX = 3   # 4000 kbps
-DEFAULT_AUDIO_IDX = 2   # 128 kbps
+DEFAULT_AUDIO_IDX = 0   # Original (beibehalten)
 
 # (label, target_height_or_None)
 RESOLUTIONS = [
@@ -170,7 +172,9 @@ class MainWindow(Gtk.Window):
         self._encoding_active = False
         self._file_streams: dict[str, tuple[list, list]] = {}
         self._completed: set[str] = set()   # successfully encoded paths
-        self._file_rotations: dict[str, int] = {}  # path → rotation degrees
+        # Per-file setting overrides.  Keys: video_bitrate, audio_bitrate,
+        # resolution_height, fps_limit, rotation.  Absent key = use global.
+        self._file_settings: dict[str, dict] = {}
         self._preview_path: Optional[str] = None    # currently previewed path
 
         self._build_ui()
@@ -440,14 +444,19 @@ class MainWindow(Gtk.Window):
         res_note.set_halign(Gtk.Align.START)
         br_grid.attach(res_note, 0, 3, 2, 1)
 
+        # FPS option
+        self._chk_fps_limit = Gtk.CheckButton(
+            label=f"HFR-Videos (>{int(HIGH_FPS_THRESHOLD)} fps) auf 30 fps begrenzen")
+        br_grid.attach(self._chk_fps_limit, 0, 4, 2, 1)
+
         # High-FPS note
         note = Gtk.Label()
         note.set_markup(
-            f'<small><i>Hinweis: Bei ≥{HIGH_FPS_THRESHOLD} fps wird die\n'
-            f'Video-Bitrate automatisch verdoppelt.</i></small>'
+            f'<small><i>Ohne Begrenzung: ≥{int(HIGH_FPS_THRESHOLD)} fps\n'
+            f'→ Video-Bitrate wird verdoppelt.</i></small>'
         )
         note.set_halign(Gtk.Align.START)
-        br_grid.attach(note, 0, 4, 2, 1)
+        br_grid.attach(note, 0, 5, 2, 1)
 
         outer.pack_end(Gtk.Box(), True, True, 0)  # spacer
         return outer
@@ -536,7 +545,7 @@ class MainWindow(Gtk.Window):
             if full in self._queue:
                 self._queue.remove(full)
             self._file_streams.pop(full, None)
-            self._file_rotations.pop(full, None)
+            self._file_settings.pop(full, None)
             self._completed.discard(full)
             model.remove(it)
         self._save_queue()
@@ -599,14 +608,15 @@ class MainWindow(Gtk.Window):
             self._show_error("Keine Dateien in der Liste.")
             return
 
-        use_src_dir       = self._chk_src_dir.get_active()
-        replace_orig      = self._radio_replace.get_active()
-        keep_name         = self._radio_same_name.get_active()
-        output_dir        = self._entry_outdir.get_text().strip()
-        custom_suffix     = self._entry_suffix.get_text().strip()
-        video_bitrate     = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
-        audio_bitrate     = AUDIO_BITRATES[self._combo_abr.get_active()][1]
-        resolution_height = RESOLUTIONS[self._combo_res.get_active()][1]
+        use_src_dir          = self._chk_src_dir.get_active()
+        replace_orig         = self._radio_replace.get_active()
+        keep_name            = self._radio_same_name.get_active()
+        output_dir           = self._entry_outdir.get_text().strip()
+        custom_suffix        = self._entry_suffix.get_text().strip()
+        global_video_bitrate = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
+        global_audio_bitrate = AUDIO_BITRATES[self._combo_abr.get_active()][1]
+        global_resolution    = RESOLUTIONS[self._combo_res.get_active()][1]
+        global_fps_limit     = 30 if self._chk_fps_limit.get_active() else None
 
         if not use_src_dir and not output_dir:
             self._show_error("Bitte ein Ausgabeverzeichnis auswählen.")
@@ -622,10 +632,17 @@ class MainWindow(Gtk.Window):
                 keep_name=keep_name,
                 custom_suffix=custom_suffix,
             )
+            fs = self._file_settings.get(path, {})
+            # Per-file settings override global; absent key → use global.
+            video_bitrate     = fs["video_bitrate"]     if "video_bitrate"     in fs else global_video_bitrate
+            audio_bitrate     = fs["audio_bitrate"]     if "audio_bitrate"     in fs else global_audio_bitrate
+            resolution_height = fs["resolution_height"] if "resolution_height" in fs else global_resolution
+            fps_limit         = fs["fps_limit"]         if "fps_limit"         in fs else global_fps_limit
+            rotation          = fs.get("rotation", 0)
+
             audio_streams, sub_streams = self._file_streams.get(path, ([], []))
             sel_audio = [s["rel_idx"] for s in audio_streams if s["enabled"]]
-            sel_subs   = [s["rel_idx"] for s in sub_streams  if s["enabled"]]
-            # Use explicit mapping only if stream info was available
+            sel_subs  = [s["rel_idx"] for s in sub_streams  if s["enabled"]]
             sel_audio_arg = sel_audio if audio_streams else None
             sel_subs_arg  = sel_subs  if sub_streams  else None
             self._jobs.append(
@@ -638,7 +655,8 @@ class MainWindow(Gtk.Window):
                     resolution_height=resolution_height,
                     selected_audio=sel_audio_arg,
                     selected_subtitles=sel_subs_arg,
-                    rotation=self._file_rotations.get(path, 0),
+                    rotation=rotation,
+                    fps_limit=fps_limit,
                 )
             )
 
@@ -793,24 +811,43 @@ class MainWindow(Gtk.Window):
     # ------------------------------------------------------------------
 
     def _save_queue(self):
-        """Write all not-yet-completed queue paths to QUEUE_FILE."""
+        """Write pending queue + per-file settings to QUEUE_FILE as JSON."""
         try:
             os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
-            pending = [p for p in self._queue if p not in self._completed]
+            data = {
+                "queue": [
+                    {
+                        "path": p,
+                        "settings": self._file_settings.get(p, {}),
+                    }
+                    for p in self._queue
+                    if p not in self._completed
+                ]
+            }
             with open(QUEUE_FILE, "w", encoding="utf-8") as fh:
-                fh.writelines(p + "\n" for p in pending)
+                json.dump(data, fh, indent=2, ensure_ascii=False)
         except Exception as exc:
             print(f"[queue] Fehler beim Speichern: {exc}", flush=True)
 
     @staticmethod
-    def _load_queue() -> list[str]:
-        """Return paths from QUEUE_FILE that still exist on disk."""
+    def _load_queue() -> list[tuple[str, dict]]:
+        """Return (path, settings) pairs from QUEUE_FILE that still exist."""
         try:
             with open(QUEUE_FILE, encoding="utf-8") as fh:
+                raw = fh.read()
+            try:
+                data = json.loads(raw)
                 return [
-                    line.rstrip("\n")
-                    for line in fh
-                    if line.strip() and os.path.isfile(line.rstrip("\n"))
+                    (e["path"], e.get("settings", {}))
+                    for e in data.get("queue", [])
+                    if os.path.isfile(e.get("path", ""))
+                ]
+            except (json.JSONDecodeError, KeyError):
+                # Legacy plain-text format (one path per line)
+                return [
+                    (line.strip(), {})
+                    for line in raw.splitlines()
+                    if line.strip() and os.path.isfile(line.strip())
                 ]
         except FileNotFoundError:
             return []
@@ -820,13 +857,14 @@ class MainWindow(Gtk.Window):
 
     def _restore_queue(self):
         """Add persisted pending paths back into the queue on startup."""
-        paths = self._load_queue()
-        if not paths:
+        entries = self._load_queue()
+        if not entries:
             return
-        for path in paths:
+        for path, settings in entries:
+            self._file_settings[path] = settings
             self._add_file(path)
         self._status_label.set_text(
-            f"{len(paths)} Datei(en) aus vorheriger Sitzung wiederhergestellt."
+            f"{len(entries)} Datei(en) aus vorheriger Sitzung wiederhergestellt."
         )
 
     def _find_row(self, path: str):
@@ -983,6 +1021,7 @@ class MainWindow(Gtk.Window):
     def _show_context_menu(self, treeview, event, tree_path, file_path: str):
         menu = Gtk.Menu()
         menu.attach_to_widget(treeview, None)
+        fs = self._file_settings.get(file_path, {})
 
         # ---- Play -------------------------------------------------------
         item_play = Gtk.MenuItem(label="▶  Abspielen")
@@ -1001,7 +1040,8 @@ class MainWindow(Gtk.Window):
                 label = self._stream_label(stream, "audio")
                 chk = Gtk.CheckMenuItem(label=label)
                 chk.set_active(stream["enabled"])
-                chk.connect("toggled", lambda btn, s=stream, fp=file_path, tp=tree_path:
+                chk.connect("toggled",
+                            lambda btn, s=stream, fp=file_path, tp=tree_path:
                             self._on_stream_toggle(btn, s, fp, tp))
                 audio_sub.append(chk)
             audio_item.set_submenu(audio_sub)
@@ -1017,7 +1057,8 @@ class MainWindow(Gtk.Window):
                 label = self._stream_label(stream, "subtitle")
                 chk = Gtk.CheckMenuItem(label=label)
                 chk.set_active(stream["enabled"])
-                chk.connect("toggled", lambda btn, s=stream, fp=file_path, tp=tree_path:
+                chk.connect("toggled",
+                            lambda btn, s=stream, fp=file_path, tp=tree_path:
                             self._on_stream_toggle(btn, s, fp, tp))
                 sub_menu.append(chk)
             sub_item.set_submenu(sub_menu)
@@ -1028,40 +1069,150 @@ class MainWindow(Gtk.Window):
         menu.append(Gtk.SeparatorMenuItem())
 
         # ---- Rotation ---------------------------------------------------
-        rot_item = Gtk.MenuItem(label="Drehung")
-        rot_menu = Gtk.Menu()
+        menu.append(self._make_radio_submenu(
+            title="Drehung",
+            options=[("Keine Drehung", 0),
+                     ("90° im Uhrzeigersinn", 90),
+                     ("90° gegen Uhrzeigersinn", -90)],
+            current=fs.get("rotation", 0),
+            global_label=None,          # rotation has no "global" option
+            on_select=lambda v, fp=file_path:
+                self._file_override_set(fp, "rotation", v),
+        ))
 
-        current_rot = self._file_rotations.get(file_path, 0)
+        menu.append(Gtk.SeparatorMenuItem())
 
-        r_none = Gtk.RadioMenuItem(label="Keine Drehung")
-        r_none.set_active(current_rot == 0)
-        rot_menu.append(r_none)
+        # ---- Per-file encoding settings ---------------------------------
+        menu.append(self._make_radio_submenu(
+            title="Video-Bitrate",
+            options=VIDEO_BITRATES,
+            current=fs.get("video_bitrate", "GLOBAL"),
+            global_label="Global verwenden",
+            on_select=lambda v, fp=file_path:
+                self._file_override_set(fp, "video_bitrate", v),
+        ))
 
-        r_cw = Gtk.RadioMenuItem.new_with_label_from_widget(r_none, "90° im Uhrzeigersinn")
-        r_cw.set_active(current_rot == 90)
-        rot_menu.append(r_cw)
+        menu.append(self._make_radio_submenu(
+            title="Audio-Bitrate",
+            options=AUDIO_BITRATES,
+            current=fs.get("audio_bitrate", "GLOBAL") if "audio_bitrate" in fs else "GLOBAL",
+            global_label="Global verwenden",
+            on_select=lambda v, fp=file_path:
+                self._file_override_set(fp, "audio_bitrate", v),
+        ))
 
-        r_ccw = Gtk.RadioMenuItem.new_with_label_from_widget(r_none, "90° gegen Uhrzeigersinn")
-        r_ccw.set_active(current_rot == -90)
-        rot_menu.append(r_ccw)
+        menu.append(self._make_radio_submenu(
+            title="Auflösung",
+            options=RESOLUTIONS,
+            current=fs.get("resolution_height", "GLOBAL") if "resolution_height" in fs else "GLOBAL",
+            global_label="Global verwenden",
+            on_select=lambda v, fp=file_path:
+                self._file_override_set(fp, "resolution_height", v),
+        ))
 
-        def _on_rot(btn, deg, fp=file_path):
-            if btn.get_active():
-                self._file_rotations[fp] = deg
+        menu.append(self._make_radio_submenu(
+            title="FPS",
+            options=[("Original behalten", None), ("Auf 30 fps begrenzen", 30)],
+            current=fs.get("fps_limit", "GLOBAL") if "fps_limit" in fs else "GLOBAL",
+            global_label="Global verwenden",
+            on_select=lambda v, fp=file_path:
+                self._file_override_set(fp, "fps_limit", v),
+        ))
 
-        r_none.connect("toggled", _on_rot, 0)
-        r_cw.connect("toggled",   _on_rot, 90)
-        r_ccw.connect("toggled",  _on_rot, -90)
+        menu.append(Gtk.SeparatorMenuItem())
 
-        rot_item.set_submenu(rot_menu)
-        menu.append(rot_item)
+        # ---- Remove from list -------------------------------------------
+        item_remove = Gtk.MenuItem(label="Aus Liste entfernen")
+        item_remove.connect("activate", lambda _, fp=file_path:
+                            self._remove_file(fp))
+        menu.append(item_remove)
 
         menu.show_all()
         menu.popup_at_pointer(event)
 
+    def _make_radio_submenu(self, title: str, options: list, current,
+                            global_label: Optional[str],
+                            on_select) -> Gtk.MenuItem:
+        """Build a MenuItem with a radio submenu.
+
+        options  – list of (label, value) tuples
+        current  – currently selected value, or "GLOBAL" sentinel
+        global_label – if not None, prepend a "Global verwenden" radio item
+        on_select(value) – called with the chosen value (or "GLOBAL")
+        """
+        parent = Gtk.MenuItem(label=title)
+        sub = Gtk.Menu()
+        buttons: list[tuple[Gtk.RadioMenuItem, object]] = []
+
+        first = None
+        if global_label is not None:
+            r = Gtk.RadioMenuItem(label=global_label)
+            first = r
+            sub.append(r)
+            buttons.append((r, "GLOBAL"))
+
+        for lbl, val in options:
+            if first is None:
+                r = Gtk.RadioMenuItem(label=lbl)
+                first = r
+            else:
+                r = Gtk.RadioMenuItem.new_with_label_from_widget(first, lbl)
+            sub.append(r)
+            buttons.append((r, val))
+
+        # Set active state before connecting signals to avoid spurious calls
+        activated = False
+        for btn, val in buttons:
+            if current == "GLOBAL" and val == "GLOBAL":
+                btn.set_active(True)
+                activated = True
+                break
+            if current != "GLOBAL" and val == current:
+                btn.set_active(True)
+                activated = True
+                break
+        if not activated and buttons:
+            buttons[0][0].set_active(True)
+
+        def _connect(btn, val):
+            def _on_toggle(b):
+                if b.get_active():
+                    on_select(val)
+                    self._save_queue()
+            btn.connect("toggled", _on_toggle)
+
+        for btn, val in buttons:
+            _connect(btn, val)
+
+        parent.set_submenu(sub)
+        return parent
+
+    def _file_override_set(self, path: str, key: str, value):
+        """Set or clear a per-file setting override and persist the queue."""
+        if value == "GLOBAL":
+            if path in self._file_settings:
+                self._file_settings[path].pop(key, None)
+                if not self._file_settings[path]:
+                    del self._file_settings[path]
+        else:
+            self._file_settings.setdefault(path, {})[key] = value
+
+    def _remove_file(self, path: str):
+        """Remove a single file from the queue and the list store."""
+        it = self._find_row(path)
+        if it:
+            self._store.remove(it)
+        if path in self._queue:
+            self._queue.remove(path)
+        self._file_streams.pop(path, None)
+        self._file_settings.pop(path, None)
+        self._completed.discard(path)
+        if self._preview_path == path:
+            self._clear_preview()
+        self._save_queue()
+
     def _on_stream_toggle(self, btn, stream: dict, file_path: str, tree_path):
         stream["enabled"] = btn.get_active()
-        # Update the hidden label columns so _update_stream_summary still works
         it = self._store.get_iter(tree_path)
         if it:
             audio, subs = self._file_streams.get(file_path, ([], []))
