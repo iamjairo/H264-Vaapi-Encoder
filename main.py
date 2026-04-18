@@ -156,6 +156,12 @@ QUEUE_FILE = os.path.join(
     "queue.txt",
 )
 
+SETTINGS_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "h264-vaapi-encoder",
+    "settings.json",
+)
+
 
 # ---------------------------------------------------------------------------
 # Main Window
@@ -181,6 +187,7 @@ class MainWindow(Gtk.Window):
         self._stop_after_path: Optional[str] = None # stop encoding queue after this file
 
         self._build_ui()
+        self._load_settings()
         self._restore_queue()
 
     # ------------------------------------------------------------------
@@ -282,11 +289,13 @@ class MainWindow(Gtk.Window):
         self._treeview = tv
 
         # Progress-bar percentage in black; light 1 px column separators.
-        # Must be applied to the screen so child CSS nodes (progress, separator)
-        # actually inherit the rules — adding to the widget node alone is not
-        # enough in GTK3.
+        # STYLE_PROVIDER_PRIORITY_USER (800) beats the dark theme (200-600)
+        # so the rule is guaranteed to win regardless of specificity.
+        # All three progressbar selectors cover different GTK versions/themes.
         _css = b"""
-            treeview progress {
+            progressbar,
+            treeview progressbar,
+            cell progressbar {
                 color: #000000;
             }
             treeview {
@@ -299,7 +308,7 @@ class MainWindow(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(),
             _prov,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            Gtk.STYLE_PROVIDER_PRIORITY_USER,
         )
 
         def col(title, idx):
@@ -514,6 +523,18 @@ class MainWindow(Gtk.Window):
 
         outer.pack_start(action_frame, False, False, 0)
         outer.pack_end(Gtk.Box(), True, True, 0)  # spacer
+
+        # Auto-save global settings whenever any control changes
+        for w in (self._combo_vbr, self._combo_abr, self._combo_res):
+            w.connect("changed", self._save_settings)
+        for w in (self._chk_fps_limit, self._chk_src_dir,
+                  self._radio_new_name, self._radio_same_name, self._radio_replace,
+                  self._radio_action_nothing, self._radio_action_quit,
+                  self._radio_action_shutdown):
+            w.connect("toggled", self._save_settings)
+        for w in (self._entry_suffix, self._entry_outdir):
+            w.connect("changed", self._save_settings)
+
         return outer
 
     def _build_preview_panel(self) -> Gtk.Widget:
@@ -936,6 +957,87 @@ class MainWindow(Gtk.Window):
         self._status_label.set_text(
             f"{len(entries)} Datei(en) aus vorheriger Sitzung wiederhergestellt."
         )
+
+    # ------------------------------------------------------------------
+    # Global settings persistence
+    # ------------------------------------------------------------------
+
+    def _save_settings(self, *_):
+        try:
+            os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+            if self._radio_same_name.get_active():
+                naming = "same_name"
+            elif self._radio_replace.get_active():
+                naming = "replace"
+            else:
+                naming = "new_name"
+            if self._radio_action_quit.get_active():
+                action = "quit"
+            elif self._radio_action_shutdown.get_active():
+                action = "shutdown"
+            else:
+                action = "nothing"
+            data = {
+                "video_bitrate_idx": self._combo_vbr.get_active(),
+                "audio_bitrate_idx": self._combo_abr.get_active(),
+                "resolution_idx":    self._combo_res.get_active(),
+                "fps_limit":         self._chk_fps_limit.get_active(),
+                "src_dir":           self._chk_src_dir.get_active(),
+                "out_dir":           self._entry_outdir.get_text(),
+                "naming":            naming,
+                "suffix":            self._entry_suffix.get_text(),
+                "post_action":       action,
+            }
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            print(f"[settings] Fehler beim Speichern: {exc}", flush=True)
+
+    def _load_settings(self):
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            return
+
+        vbr = data.get("video_bitrate_idx", DEFAULT_VIDEO_IDX)
+        if 0 <= vbr < len(VIDEO_BITRATES):
+            self._combo_vbr.set_active(vbr)
+
+        abr = data.get("audio_bitrate_idx", DEFAULT_AUDIO_IDX)
+        if 0 <= abr < len(AUDIO_BITRATES):
+            self._combo_abr.set_active(abr)
+
+        res = data.get("resolution_idx", DEFAULT_RES_IDX)
+        if 0 <= res < len(RESOLUTIONS):
+            self._combo_res.set_active(res)
+
+        self._chk_fps_limit.set_active(data.get("fps_limit", False))
+
+        src_dir = data.get("src_dir", True)
+        self._chk_src_dir.set_active(src_dir)
+        out_dir = data.get("out_dir", "")
+        if out_dir:
+            self._entry_outdir.set_text(out_dir)
+
+        naming = data.get("naming", "new_name")
+        if naming == "same_name":
+            self._radio_same_name.set_active(True)
+        elif naming == "replace":
+            self._radio_replace.set_active(True)
+        else:
+            self._radio_new_name.set_active(True)
+
+        suffix = data.get("suffix", "_h264")
+        self._entry_suffix.set_text(suffix)
+
+        action = data.get("post_action", "nothing")
+        if action == "quit":
+            self._radio_action_quit.set_active(True)
+        elif action == "shutdown":
+            self._radio_action_shutdown.set_active(True)
+        else:
+            self._radio_action_nothing.set_active(True)
 
     def _set_stop_after(self, path: Optional[str]):
         """Set (or clear) the stop-after marker. Pass None to clear."""
