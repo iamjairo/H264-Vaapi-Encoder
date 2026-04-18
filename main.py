@@ -9,6 +9,7 @@ from urllib.parse import unquote
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, GObject, Pango
+from gi.repository import PangoCairo
 import subprocess
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf
@@ -164,6 +165,33 @@ SETTINGS_FILE = os.path.join(
 
 
 # ---------------------------------------------------------------------------
+# Custom cell renderer: progress bar with always-black percentage text
+# ---------------------------------------------------------------------------
+
+class ProgressCellRenderer(Gtk.CellRendererProgress):
+    """CellRendererProgress that draws the text label in pure black via Cairo,
+    bypassing the theme colour that GTK applies internally per bar segment."""
+    __gtype_name__ = "ProgressCellRenderer"
+
+    def do_render(self, cr, widget, background_area, cell_area, flags):
+        text = self.props.text or ""
+        self.props.text = ""                    # suppress built-in text
+        Gtk.CellRendererProgress.do_render(
+            self, cr, widget, background_area, cell_area, flags)
+        self.props.text = text
+
+        if not text:
+            return
+        layout = widget.create_pango_layout(text)
+        lw, lh = layout.get_pixel_size()
+        tx = cell_area.x + (cell_area.width  - lw) / 2
+        ty = cell_area.y + (cell_area.height - lh) / 2
+        cr.set_source_rgb(0.0, 0.0, 0.0)
+        cr.move_to(tx, ty)
+        PangoCairo.show_layout(cr, layout)
+
+
+# ---------------------------------------------------------------------------
 # Main Window
 # ---------------------------------------------------------------------------
 
@@ -288,16 +316,8 @@ class MainWindow(Gtk.Window):
         tv.set_grid_lines(Gtk.TreeViewGridLines.VERTICAL)
         self._treeview = tv
 
-        # Progress-bar percentage in black; light 1 px column separators.
-        # STYLE_PROVIDER_PRIORITY_USER (800) beats the dark theme (200-600)
-        # so the rule is guaranteed to win regardless of specificity.
-        # All three progressbar selectors cover different GTK versions/themes.
+        # Light 1 px vertical column separators.
         _css = b"""
-            progressbar,
-            treeview progressbar,
-            cell progressbar {
-                color: #000000;
-            }
             treeview {
                 -GtkTreeView-grid-line-width: 1;
                 border-color: alpha(white, 0.15);
@@ -308,7 +328,7 @@ class MainWindow(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(),
             _prov,
-            Gtk.STYLE_PROVIDER_PRIORITY_USER,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
 
         def col(title, idx):
@@ -332,7 +352,7 @@ class MainWindow(Gtk.Window):
         col("Status",      COL_STATUS)
 
         # Progress column
-        prog_cell = Gtk.CellRendererProgress()
+        prog_cell = ProgressCellRenderer()
         prog_col = Gtk.TreeViewColumn("Fortschritt", prog_cell, value=COL_PROGRESS)
         prog_col.set_expand(True)
         prog_col.set_resizable(True)
