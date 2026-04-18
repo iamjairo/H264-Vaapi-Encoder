@@ -74,6 +74,7 @@ COL_VID_BITRATE = 8   # e.g. "4.3 Mbps"
 COL_AUD_BITRATE = 9   # e.g. "128 kbps"
 COL_FPS         = 10  # e.g. "59.94"
 COL_DURATION    = 11  # e.g. "1:23:45"
+COL_STOP_MARKER = 12  # "⏹" when stop-after is set, "" otherwise
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,7 @@ class MainWindow(Gtk.Window):
         # resolution_height, fps_limit, rotation.  Absent key = use global.
         self._file_settings: dict[str, dict] = {}
         self._preview_path: Optional[str] = None    # currently previewed path
+        self._stop_after_path: Optional[str] = None # stop encoding queue after this file
 
         self._build_ui()
         self._restore_queue()
@@ -271,7 +273,7 @@ class MainWindow(Gtk.Window):
         #          resolution, vid-bitrate, aud-bitrate, fps, duration
         self._store = Gtk.ListStore(str, str, str, int, str,
                                     str, str, str, str, str,
-                                    str, str)
+                                    str, str, str)
 
         tv = Gtk.TreeView(model=self._store)
         tv.set_reorderable(True)
@@ -285,6 +287,14 @@ class MainWindow(Gtk.Window):
             c.set_expand(True)
             c.set_resizable(True)
             tv.append_column(c)
+
+        # Stop-after marker column (very narrow, no header text)
+        stop_cell = Gtk.CellRendererText()
+        stop_cell.set_property("foreground", "#e74c3c")
+        stop_col = Gtk.TreeViewColumn("", stop_cell, text=COL_STOP_MARKER)
+        stop_col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+        stop_col.set_resizable(False)
+        tv.append_column(stop_col)
 
         col("Dateiname",   COL_FILENAME)
         col("Verzeichnis", COL_DIRECTORY)
@@ -770,7 +780,11 @@ class MainWindow(Gtk.Window):
 
         self._current_index += 1
         if self._encoding_active:
-            self._encode_next()
+            if success and self._stop_after_path == path:
+                self._set_stop_after(None)
+                self._encoding_done()
+            else:
+                self._encode_next()
 
     def _encoding_done(self):
         self._encoding_active = False
@@ -778,6 +792,8 @@ class MainWindow(Gtk.Window):
         self._btn_cancel.set_sensitive(False)
         self._global_progress.set_fraction(1.0)
         self._status_label.set_text("Alle Aufgaben abgeschlossen.")
+        if self._stop_after_path:
+            self._set_stop_after(None)
 
         if self._radio_action_quit.get_active():
             Gtk.main_quit()
@@ -805,6 +821,7 @@ class MainWindow(Gtk.Window):
                     path,
                     "Lädt…", "Lädt…",         # audio / sub labels
                     "–", "–", "–", "–", "–",  # resolution / vid-br / aud-br / fps / duration
+                    "",                       # stop marker
                 ])
             ),
         )
@@ -898,6 +915,20 @@ class MainWindow(Gtk.Window):
         self._status_label.set_text(
             f"{len(entries)} Datei(en) aus vorheriger Sitzung wiederhergestellt."
         )
+
+    def _set_stop_after(self, path: Optional[str]):
+        """Set (or clear) the stop-after marker. Pass None to clear."""
+        # Clear old marker
+        if self._stop_after_path:
+            it = self._find_row(self._stop_after_path)
+            if it:
+                self._store.set_value(it, COL_STOP_MARKER, "")
+        self._stop_after_path = path
+        # Set new marker
+        if path:
+            it = self._find_row(path)
+            if it:
+                self._store.set_value(it, COL_STOP_MARKER, "⏹")
 
     def _find_row(self, path: str):
         it = self._store.get_iter_first()
@@ -1153,6 +1184,18 @@ class MainWindow(Gtk.Window):
 
         menu.append(Gtk.SeparatorMenuItem())
 
+        # ---- Stop after this file ---------------------------------------
+        is_stop = self._stop_after_path == file_path
+        stop_label = "⏹  Nach dieser Datei stoppen ✓" if is_stop else "⏹  Nach dieser Datei stoppen"
+        item_stop = Gtk.MenuItem(label=stop_label)
+        item_stop.connect(
+            "activate",
+            lambda _, fp=file_path: self._set_stop_after(None if self._stop_after_path == fp else fp),
+        )
+        menu.append(item_stop)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
         # ---- Remove from list -------------------------------------------
         item_remove = Gtk.MenuItem(label="Aus Liste entfernen")
         item_remove.connect("activate", lambda _, fp=file_path:
@@ -1231,6 +1274,8 @@ class MainWindow(Gtk.Window):
 
     def _remove_file(self, path: str):
         """Remove a single file from the queue and the list store."""
+        if self._stop_after_path == path:
+            self._stop_after_path = None   # row is gone, no need to clear the cell
         it = self._find_row(path)
         if it:
             self._store.remove(it)
