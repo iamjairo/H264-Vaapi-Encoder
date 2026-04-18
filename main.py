@@ -18,6 +18,7 @@ from encoder import (
     Encoder, EncodeJob,
     get_fps, get_video_dimensions, compute_output_dimensions,
     get_file_metadata, scan_folder, HIGH_FPS_THRESHOLD,
+    VIDEO_EXTENSIONS,
 )
 
 # ---------------------------------------------------------------------------
@@ -594,13 +595,16 @@ class MainWindow(Gtk.Window):
             if not uri:
                 continue
             try:
-                # GLib properly decodes percent-encoded URIs (e.g. spaces → %20)
                 path, _ = GLib.filename_from_uri(uri)
             except Exception:
                 path = unquote(uri.removeprefix("file://"))
             if os.path.isfile(path):
                 self._add_file(path)
-        # Signal the drag source that the drop was handled successfully.
+            elif os.path.isdir(path):
+                for root, _dirs, files in os.walk(path):
+                    for f in sorted(files):
+                        if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS:
+                            self._add_file(os.path.join(root, f))
         Gtk.drag_finish(drag_context, True, False, time)
 
     def _on_start_encode(self, *_):
