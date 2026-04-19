@@ -766,6 +766,14 @@ class MainWindow(Gtk.Window):
                 # whose gint* new_order array can fail to marshal in PyGObject.
                 self._sync_queue_from_store()
                 self._save_queue()
+                # Mirror the new order into self._jobs so _encode_next
+                # uses the correct sequence during active encoding.
+                if self._encoding_active and hasattr(self, "_jobs"):
+                    jobs_by_path = {j.input_path: j for j in self._jobs}
+                    new_jobs = [jobs_by_path[p] for p in self._queue
+                                if p in jobs_by_path]
+                    # Keep the currently-encoding job at _current_index.
+                    self._jobs[:] = new_jobs
             Gtk.drag_finish(drag_context, src_iter is not None, False, time)
             return
 
