@@ -210,6 +210,7 @@ class MainWindow(Gtk.Window):
         self._current_index: int = -1
         self._encoding_active = False
         self._file_streams: dict[str, tuple[list, list]] = {}
+        self._file_metadata: dict[str, dict] = {}  # raw probe results keyed by path
         self._completed: set[str] = set()   # successfully encoded paths
         # Per-file setting overrides.  Keys: video_bitrate, audio_bitrate,
         # resolution_height, fps_limit, rotation.  Absent key = use global.
@@ -742,6 +743,23 @@ class MainWindow(Gtk.Window):
             fps_limit         = fs["fps_limit"]         if "fps_limit"         in fs else global_fps_limit
             rotation          = fs.get("rotation", 0)
 
+            # No-upscaling guards (use cached probe data, no extra ffprobe call)
+            src = self._file_metadata.get(path, {})
+
+            # Resolution: if source is already smaller or equal, keep original
+            if resolution_height is not None:
+                src_h = src.get("height", 0)
+                if src_h > 0 and src_h <= resolution_height:
+                    resolution_height = None
+
+            # Audio bitrate: if source bitrate is at or below target, stream-copy
+            if audio_bitrate is not None:
+                src_audio_kbps = src.get("audio_kbps")
+                if src_audio_kbps is not None:
+                    target_kbps = int(audio_bitrate.rstrip("k"))
+                    if src_audio_kbps <= target_kbps:
+                        audio_bitrate = None  # stream-copy
+
             audio_streams, sub_streams = self._file_streams.get(path, ([], []))
             sel_audio = [s["rel_idx"] for s in audio_streams if s["enabled"]]
             sel_subs  = [s["rel_idx"] for s in sub_streams  if s["enabled"]]
@@ -896,7 +914,8 @@ class MainWindow(Gtk.Window):
             meta = get_file_metadata(path)
 
             def _apply():
-                self._file_streams[path] = (meta["audio"], meta["subtitles"])
+                self._file_streams[path]   = (meta["audio"], meta["subtitles"])
+                self._file_metadata[path]  = meta
                 tp = row_ref.get_path()
                 if tp:
                     it = self._store.get_iter(tp)
@@ -1461,6 +1480,7 @@ class MainWindow(Gtk.Window):
         if path in self._queue:
             self._queue.remove(path)
         self._file_streams.pop(path, None)
+        self._file_metadata.pop(path, None)
         self._file_settings.pop(path, None)
         self._completed.discard(path)
         if self._preview_path == path:
