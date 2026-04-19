@@ -1199,6 +1199,17 @@ class MainWindow(Gtk.Window):
         self._sync_queue_from_store()
         self._save_queue()
 
+        # Also reorder _jobs so _encode_next processes files in the right order.
+        if self._encoding_active:
+            insert_at = self._current_index + 1
+            job_idx = next(
+                (i for i, j in enumerate(self._jobs) if j.input_path == file_path),
+                None,
+            )
+            if job_idx is not None and job_idx != insert_at:
+                job = self._jobs.pop(job_idx)
+                self._jobs.insert(insert_at, job)
+
     def _set_stop_after(self, path: Optional[str]):
         """Set (or clear) the stop-after marker. Pass None to clear."""
         # Clear old marker

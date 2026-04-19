@@ -380,7 +380,7 @@ def build_ffmpeg_cmd(job: EncodeJob, fps: float) -> list[str]:
         if job.resolution_height is not None:
             filters.append(f"scale=w=-2:h={job.resolution_height}")
         filters += ["format=nv12", "hwupload"]
-        vf_args = ["-vf", ",".join(filters)]
+        vf_args = ["-noautoscale", "-vf", ",".join(filters)]
     else:
         # No scaling, no rotation, no fps filter → full HW-decode pipeline.
         hw_args = ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
