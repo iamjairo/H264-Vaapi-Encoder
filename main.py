@@ -400,14 +400,20 @@ class MainWindow(Gtk.Window):
             [Gtk.TargetEntry.new(_ROW_TARGET, Gtk.TargetFlags.SAME_WIDGET, 0)],
             Gdk.DragAction.MOVE,
         )
+        # DestDefaults.DROP only: auto-calls gtk_drag_get_data on drop so
+        # drag-data-received fires.  We handle MOTION ourselves to get the
+        # TreeView row-level indicator line (set_drag_dest_row), which the
+        # generic MOTION default never calls.
         tv.drag_dest_set(
-            Gtk.DestDefaults.ALL,
+            Gtk.DestDefaults.DROP,
             [
                 Gtk.TargetEntry.new(_ROW_TARGET, Gtk.TargetFlags.SAME_WIDGET, 0),
                 Gtk.TargetEntry.new("text/uri-list", 0, 1),
             ],
             Gdk.DragAction.MOVE | Gdk.DragAction.COPY,
         )
+        tv.connect("drag-motion",        self._on_drag_motion)
+        tv.connect("drag-leave",         self._on_drag_leave)
         tv.connect("drag-data-get",      self._on_drag_data_get)
         tv.connect("drag-data-received", self._on_drag_data)
 
@@ -701,6 +707,31 @@ class MainWindow(Gtk.Window):
         if dialog.run() == Gtk.ResponseType.OK:
             self._entry_outdir.set_text(dialog.get_filename())
         dialog.destroy()
+
+    def _on_drag_motion(self, widget, ctx, x, y, time):
+        """Show the row-level drop-indicator line while dragging."""
+        drop = widget.get_dest_row_at_pos(x, y)
+        if drop is not None:
+            path, pos = drop
+            widget.set_drag_dest_row(path, pos)
+        else:
+            # Below all rows → indicator after the last row
+            n = self._store.iter_n_children(None)
+            if n > 0:
+                last_it = self._store.iter_nth_child(None, n - 1)
+                widget.set_drag_dest_row(
+                    self._store.get_path(last_it),
+                    Gtk.TreeViewDropPosition.AFTER,
+                )
+        # Tell GDK the drop is accepted and which action we'll perform
+        src = Gtk.drag_get_source_widget(ctx)
+        action = Gdk.DragAction.MOVE if src is widget else Gdk.DragAction.COPY
+        Gdk.drag_status(ctx, action, time)
+        return True   # we handled the motion
+
+    def _on_drag_leave(self, widget, ctx, time):
+        """Clear the drop-indicator line when the drag leaves the widget."""
+        widget.set_drag_dest_row(None, Gtk.TreeViewDropPosition.BEFORE)
 
     def _on_drag_data_get(self, widget, ctx, data, info, time):
         """Supply the dragged row's full path as the drag payload."""
