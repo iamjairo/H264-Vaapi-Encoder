@@ -762,6 +762,10 @@ class MainWindow(Gtk.Window):
                         self._store.move_before(src_iter, dest_iter)
                     else:
                         self._store.move_after(src_iter, dest_iter)
+                # Sync queue immediately — don't rely on rows-reordered signal
+                # whose gint* new_order array can fail to marshal in PyGObject.
+                self._sync_queue_from_store()
+                self._save_queue()
             Gtk.drag_finish(drag_context, src_iter is not None, False, time)
             return
 
@@ -1192,7 +1196,8 @@ class MainWindow(Gtk.Window):
             self._store.move_after(it, current_it)
         else:
             self._store.move_after(it, None)  # None → move to the very beginning
-        # rows-reordered fires automatically and handles sync + save
+        self._sync_queue_from_store()
+        self._save_queue()
 
     def _set_stop_after(self, path: Optional[str]):
         """Set (or clear) the stop-after marker. Pass None to clear."""
