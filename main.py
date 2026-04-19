@@ -909,9 +909,10 @@ class MainWindow(Gtk.Window):
             ),
         )
 
-        # Single ffprobe call in background — fills streams AND tech info.
+        # Fill streams and tech info: use cached metadata if available
+        # (happens on queue restore), otherwise probe via ffprobe.
         def _probe():
-            meta = get_file_metadata(path)
+            meta = self._file_metadata.get(path) or get_file_metadata(path)
 
             def _apply():
                 self._file_streams[path]   = (meta["audio"], meta["subtitles"])
@@ -952,6 +953,7 @@ class MainWindow(Gtk.Window):
                     {
                         "path": p,
                         "settings": self._file_settings.get(p, {}),
+                        "meta":     self._file_metadata.get(p, {}),
                     }
                     for p in self._queue
                     if p not in self._completed
@@ -963,22 +965,22 @@ class MainWindow(Gtk.Window):
             print(f"[queue] Fehler beim Speichern: {exc}", flush=True)
 
     @staticmethod
-    def _load_queue() -> list[tuple[str, dict]]:
-        """Return (path, settings) pairs from QUEUE_FILE that still exist."""
+    def _load_queue() -> list[tuple[str, dict, dict]]:
+        """Return (path, settings, meta) triples from QUEUE_FILE that still exist."""
         try:
             with open(QUEUE_FILE, encoding="utf-8") as fh:
                 raw = fh.read()
             try:
                 data = json.loads(raw)
                 return [
-                    (e["path"], e.get("settings", {}))
+                    (e["path"], e.get("settings", {}), e.get("meta", {}))
                     for e in data.get("queue", [])
                     if os.path.isfile(e.get("path", ""))
                 ]
             except (json.JSONDecodeError, KeyError):
                 # Legacy plain-text format (one path per line)
                 return [
-                    (line.strip(), {})
+                    (line.strip(), {}, {})
                     for line in raw.splitlines()
                     if line.strip() and os.path.isfile(line.strip())
                 ]
@@ -993,8 +995,12 @@ class MainWindow(Gtk.Window):
         entries = self._load_queue()
         if not entries:
             return
-        for path, settings in entries:
+        for path, settings, meta in entries:
             self._file_settings[path] = settings
+            if meta:
+                # Pre-populate metadata cache so _add_file skips the ffprobe call
+                self._file_metadata[path] = meta
+        for path, settings, meta in entries:
             self._add_file(path)
         self._status_label.set_text(
             f"{len(entries)} Datei(en) aus vorheriger Sitzung wiederhergestellt."
