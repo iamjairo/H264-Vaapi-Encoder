@@ -315,7 +315,6 @@ class MainWindow(Gtk.Window):
                                     str, str, str)
 
         tv = Gtk.TreeView(model=self._store)
-        tv.set_reorderable(True)
         tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         tv.set_grid_lines(Gtk.TreeViewGridLines.VERTICAL)
         self._treeview = tv
@@ -386,16 +385,25 @@ class MainWindow(Gtk.Window):
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.add(tv)
 
-        # Drag-and-drop target
-        try:
-            tv.drag_dest_set(
-                Gtk.DestDefaults.ALL,
-                [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
-                Gdk.DragAction.COPY,
-            )
-            tv.connect("drag-data-received", self._on_drag_data)
-        except Exception:
-            pass
+        # DnD: row reorder (internal) + file drop from file manager (external).
+        # Using enable_model_drag_source means GTK serialises the source row
+        # path automatically; drag_dest_set (not enable_model_drag_dest) means
+        # GTK's internal class-level handler stays silent, so our
+        # drag-data-received handles both target types exclusively.
+        tv.enable_model_drag_source(
+            Gdk.ModifierType.BUTTON1_MASK,
+            [Gtk.TargetEntry.new("GTK_TREE_MODEL_ROW", Gtk.TargetFlags.SAME_WIDGET, 0)],
+            Gdk.DragAction.MOVE,
+        )
+        tv.drag_dest_set(
+            Gtk.DestDefaults.ALL,
+            [
+                Gtk.TargetEntry.new("GTK_TREE_MODEL_ROW", Gtk.TargetFlags.SAME_WIDGET, 0),
+                Gtk.TargetEntry.new("text/uri-list", 0, 1),
+            ],
+            Gdk.DragAction.MOVE | Gdk.DragAction.COPY,
+        )
+        tv.connect("drag-data-received", self._on_drag_data)
 
         frame.add(sw)
         return frame
@@ -689,6 +697,26 @@ class MainWindow(Gtk.Window):
         dialog.destroy()
 
     def _on_drag_data(self, widget, drag_context, x, y, data, info, time):
+        if info == 0:
+            # ---- Internal row reorder (GTK_TREE_MODEL_ROW) --------------
+            ok, _model, src_path = Gtk.tree_get_row_drag_data(data)
+            if ok:
+                src_iter = self._store.get_iter(src_path)
+                drop = widget.get_dest_row_at_pos(x, y)
+                if drop is None:
+                    self._store.move_before(src_iter, None)   # to end
+                else:
+                    dest_path, pos = drop
+                    dest_iter = self._store.get_iter(dest_path)
+                    if pos in (Gtk.TreeViewDropPosition.BEFORE,
+                               Gtk.TreeViewDropPosition.INTO_OR_BEFORE):
+                        self._store.move_before(src_iter, dest_iter)
+                    else:
+                        self._store.move_after(src_iter, dest_iter)
+            Gtk.drag_finish(drag_context, ok, False, time)
+            return
+
+        # ---- External file / folder drop (text/uri-list) ----------------
         from gi.repository import GLib
         for uri in data.get_uris():
             uri = uri.strip()
