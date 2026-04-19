@@ -386,23 +386,29 @@ class MainWindow(Gtk.Window):
         sw.add(tv)
 
         # DnD: row reorder (internal) + file drop from file manager (external).
-        # Using enable_model_drag_source means GTK serialises the source row
-        # path automatically; drag_dest_set (not enable_model_drag_dest) means
-        # GTK's internal class-level handler stays silent, so our
-        # drag-data-received handles both target types exclusively.
-        tv.enable_model_drag_source(
+        #
+        # We use plain drag_source_set (NOT enable_model_drag_source) so that
+        # GTK never touches the model's GtkTreeDragSource interface.  That
+        # interface would call drag_data_delete (removing the row) as part of
+        # the MOVE protocol, causing the premature-disappearance/end-of-list
+        # bug.  Instead we use a private target type, supply the data ourselves
+        # in drag-data-get, and move the row only in drag-data-received (which
+        # fires exclusively on actual drop / button-release).
+        _ROW_TARGET = "application/x-h264enc-row"
+        tv.drag_source_set(
             Gdk.ModifierType.BUTTON1_MASK,
-            [Gtk.TargetEntry.new("GTK_TREE_MODEL_ROW", Gtk.TargetFlags.SAME_WIDGET, 0)],
+            [Gtk.TargetEntry.new(_ROW_TARGET, Gtk.TargetFlags.SAME_WIDGET, 0)],
             Gdk.DragAction.MOVE,
         )
         tv.drag_dest_set(
             Gtk.DestDefaults.ALL,
             [
-                Gtk.TargetEntry.new("GTK_TREE_MODEL_ROW", Gtk.TargetFlags.SAME_WIDGET, 0),
+                Gtk.TargetEntry.new(_ROW_TARGET, Gtk.TargetFlags.SAME_WIDGET, 0),
                 Gtk.TargetEntry.new("text/uri-list", 0, 1),
             ],
             Gdk.DragAction.MOVE | Gdk.DragAction.COPY,
         )
+        tv.connect("drag-data-get",      self._on_drag_data_get)
         tv.connect("drag-data-received", self._on_drag_data)
 
         frame.add(sw)
@@ -696,12 +702,24 @@ class MainWindow(Gtk.Window):
             self._entry_outdir.set_text(dialog.get_filename())
         dialog.destroy()
 
+    def _on_drag_data_get(self, widget, ctx, data, info, time):
+        """Supply the dragged row's full path as the drag payload."""
+        model, paths = widget.get_selection().get_selected_rows()
+        if paths:
+            it = self._store.get_iter(paths[0])
+            file_path = self._store.get_value(it, COL_FULLPATH)
+            data.set(data.get_target(), 8, file_path.encode("utf-8"))
+
     def _on_drag_data(self, widget, drag_context, x, y, data, info, time):
         if info == 0:
-            # ---- Internal row reorder (GTK_TREE_MODEL_ROW) --------------
-            ok, _model, src_path = Gtk.tree_get_row_drag_data(data)
-            if ok:
-                src_iter = self._store.get_iter(src_path)
+            # ---- Internal row reorder -----------------------------------
+            try:
+                file_path = data.get_data().decode("utf-8")
+            except Exception:
+                Gtk.drag_finish(drag_context, False, False, time)
+                return
+            src_iter = self._find_row(file_path)
+            if src_iter:
                 drop = widget.get_dest_row_at_pos(x, y)
                 if drop is None:
                     self._store.move_before(src_iter, None)   # to end
@@ -713,7 +731,7 @@ class MainWindow(Gtk.Window):
                         self._store.move_before(src_iter, dest_iter)
                     else:
                         self._store.move_after(src_iter, dest_iter)
-            Gtk.drag_finish(drag_context, ok, False, time)
+            Gtk.drag_finish(drag_context, src_iter is not None, False, time)
             return
 
         # ---- External file / folder drop (text/uri-list) ----------------
