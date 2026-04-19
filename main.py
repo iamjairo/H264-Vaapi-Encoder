@@ -380,6 +380,7 @@ class MainWindow(Gtk.Window):
         tv.connect("button-press-event", self._on_treeview_button_press)
         tv.connect("row-activated",      self._on_row_activated)
         tv.get_selection().connect("changed", self._on_selection_changed)
+        self._store.connect("rows-reordered", self._on_rows_reordered)
 
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -1087,6 +1088,35 @@ class MainWindow(Gtk.Window):
         else:
             self._radio_action_nothing.set_active(True)
 
+    def _sync_queue_from_store(self):
+        """Rebuild self._queue to match the current ListStore row order."""
+        it = self._store.get_iter_first()
+        self._queue = []
+        while it:
+            self._queue.append(self._store.get_value(it, COL_FULLPATH))
+            it = self._store.iter_next(it)
+
+    def _on_rows_reordered(self, model, path, tree_iter, new_order):
+        """Called whenever rows are reordered by D&D or programmatically."""
+        self._sync_queue_from_store()
+        self._save_queue()
+
+    def _move_to_front(self, file_path: str):
+        """Move file_path to the top of the queue, or right after the
+        currently encoding file when encoding is active."""
+        it = self._find_row(file_path)
+        if not it:
+            return
+        if self._encoding_active and 0 <= self._current_index < len(self._jobs):
+            current_path = self._jobs[self._current_index].input_path
+            if current_path == file_path:
+                return  # can't displace the file being encoded right now
+            current_it = self._find_row(current_path)
+            self._store.move_after(it, current_it)
+        else:
+            self._store.move_after(it, None)  # None → move to the very beginning
+        # rows-reordered fires automatically and handles sync + save
+
     def _set_stop_after(self, path: Optional[str]):
         """Set (or clear) the stop-after marker. Pass None to clear."""
         # Clear old marker
@@ -1397,6 +1427,21 @@ class MainWindow(Gtk.Window):
             lambda _, fp=file_path: self._set_stop_after(None if self._stop_after_path == fp else fp),
         )
         menu.append(item_stop)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # ---- Move to front ----------------------------------------------
+        is_encoding_this = (self._encoding_active
+                            and 0 <= self._current_index < len(self._jobs)
+                            and self._jobs[self._current_index].input_path == file_path)
+        if self._encoding_active and not is_encoding_this:
+            move_label = "⬆  Als nächstes kodieren"
+        else:
+            move_label = "⬆  An den Anfang der Liste"
+        item_move = Gtk.MenuItem(label=move_label)
+        item_move.set_sensitive(not is_encoding_this)
+        item_move.connect("activate", lambda _, fp=file_path: self._move_to_front(fp))
+        menu.append(item_move)
 
         menu.append(Gtk.SeparatorMenuItem())
 
