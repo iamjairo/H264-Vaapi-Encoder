@@ -1023,6 +1023,12 @@ class MainWindow(Gtk.Window):
                                          _fmt_fps(meta["fps"]))
                     self._store.set_value(it, COL_DURATION,
                                          _fmt_duration(meta["duration_secs"]))
+                # If encoding is already running, append a job for this file
+                # so _encode_next won't stop before reaching it.
+                if self._encoding_active and hasattr(self, "_jobs"):
+                    already = any(j.input_path == path for j in self._jobs)
+                    if not already:
+                        self._jobs.append(self._build_job(path))
                 return False
 
             GLib.idle_add(_apply)
