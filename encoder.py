@@ -266,7 +266,10 @@ def get_file_metadata(path: str) -> dict:
                 if dur:
                     out["duration_secs"] = float(dur)
             elif ctype == "audio":
-                abr = stream.get("bit_rate")
+                # bit_rate is absent in many containers (MKV/AAC etc.);
+                # fall back to the Matroska BPS tag when present.
+                abr = (stream.get("bit_rate")
+                       or tags.get("BPS") or tags.get("BPS-eng"))
                 if abr and out["audio_kbps"] is None:
                     out["audio_kbps"] = max(1, int(abr) // 1000)
                 out["audio"].append({
@@ -285,10 +288,14 @@ def get_file_metadata(path: str) -> dict:
                 })
                 s_idx += 1
 
-        # Fallback: derive video bitrate from overall minus audio.
+        # Fallback: derive video bitrate from overall minus audio (and vice-versa).
         if out["video_kbps"] is None and overall_kbps:
             audio_kbps = out["audio_kbps"] or 0
             out["video_kbps"] = max(1, overall_kbps - audio_kbps)
+        if out["audio_kbps"] is None and overall_kbps and out["video_kbps"]:
+            remainder = overall_kbps - out["video_kbps"]
+            if remainder > 0:
+                out["audio_kbps"] = remainder
 
     except Exception:
         pass
