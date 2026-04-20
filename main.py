@@ -1431,6 +1431,11 @@ class MainWindow(Gtk.Window):
         menu.attach_to_widget(treeview, None)
         fs = self._file_settings.get(file_path, {})
 
+        row_iter = self._find_row(file_path)
+        status = (self._store.get_value(row_iter, COL_STATUS)
+                  if row_iter else STATUS_PENDING)
+        is_done = status in (STATUS_DONE, STATUS_CANCELLED) or status.startswith(STATUS_ERROR)
+
         # ---- Play / Show in folder --------------------------------------
         item_play = Gtk.MenuItem(label="▶  Abspielen")
         item_play.connect("activate", lambda _: self._play_file(file_path))
@@ -1446,7 +1451,7 @@ class MainWindow(Gtk.Window):
         audio, subs = self._file_streams.get(file_path, ([], []))
 
         audio_item = Gtk.MenuItem(label="Audiospuren")
-        if audio:
+        if audio and not is_done:
             audio_sub = Gtk.Menu()
             for stream in audio:
                 label = self._stream_label(stream, "audio")
@@ -1463,7 +1468,7 @@ class MainWindow(Gtk.Window):
 
         # ---- Subtitle tracks --------------------------------------------
         sub_item = Gtk.MenuItem(label="Untertitel")
-        if subs:
+        if subs and not is_done:
             sub_menu = Gtk.Menu()
             for stream in subs:
                 label = self._stream_label(stream, "subtitle")
@@ -1481,55 +1486,58 @@ class MainWindow(Gtk.Window):
         menu.append(Gtk.SeparatorMenuItem())
 
         # ---- Rotation ---------------------------------------------------
-        menu.append(self._make_radio_submenu(
+        rot_item = self._make_radio_submenu(
             title="Drehung",
             options=[("Keine Drehung", 0),
                      ("90° im Uhrzeigersinn", 90),
                      ("90° gegen Uhrzeigersinn", -90)],
             current=fs.get("rotation", 0),
-            global_label=None,          # rotation has no "global" option
+            global_label=None,
             on_select=lambda v, fp=file_path:
                 self._file_override_set(fp, "rotation", v),
-        ))
+        )
+        rot_item.set_sensitive(not is_done)
+        menu.append(rot_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
         # ---- Per-file encoding settings ---------------------------------
-        menu.append(self._make_radio_submenu(
-            title="Video-Bitrate",
-            options=VIDEO_BITRATES,
-            current=fs.get("video_bitrate", "GLOBAL"),
-            global_label="Global verwenden",
-            on_select=lambda v, fp=file_path:
-                self._file_override_set(fp, "video_bitrate", v),
-        ))
-
-        menu.append(self._make_radio_submenu(
-            title="Audio-Bitrate",
-            options=AUDIO_BITRATES,
-            current=fs.get("audio_bitrate", "GLOBAL") if "audio_bitrate" in fs else "GLOBAL",
-            global_label="Global verwenden",
-            on_select=lambda v, fp=file_path:
-                self._file_override_set(fp, "audio_bitrate", v),
-        ))
-
-        menu.append(self._make_radio_submenu(
-            title="Auflösung",
-            options=RESOLUTIONS,
-            current=fs.get("resolution_height", "GLOBAL") if "resolution_height" in fs else "GLOBAL",
-            global_label="Global verwenden",
-            on_select=lambda v, fp=file_path:
-                self._file_override_set(fp, "resolution_height", v),
-        ))
-
-        menu.append(self._make_radio_submenu(
-            title="FPS",
-            options=[("Original behalten", None), ("Auf 30 fps begrenzen", 30)],
-            current=fs.get("fps_limit", "GLOBAL") if "fps_limit" in fs else "GLOBAL",
-            global_label="Global verwenden",
-            on_select=lambda v, fp=file_path:
-                self._file_override_set(fp, "fps_limit", v),
-        ))
+        for item in [
+            self._make_radio_submenu(
+                title="Video-Bitrate",
+                options=VIDEO_BITRATES,
+                current=fs.get("video_bitrate", "GLOBAL"),
+                global_label="Global verwenden",
+                on_select=lambda v, fp=file_path:
+                    self._file_override_set(fp, "video_bitrate", v),
+            ),
+            self._make_radio_submenu(
+                title="Audio-Bitrate",
+                options=AUDIO_BITRATES,
+                current=fs.get("audio_bitrate", "GLOBAL") if "audio_bitrate" in fs else "GLOBAL",
+                global_label="Global verwenden",
+                on_select=lambda v, fp=file_path:
+                    self._file_override_set(fp, "audio_bitrate", v),
+            ),
+            self._make_radio_submenu(
+                title="Auflösung",
+                options=RESOLUTIONS,
+                current=fs.get("resolution_height", "GLOBAL") if "resolution_height" in fs else "GLOBAL",
+                global_label="Global verwenden",
+                on_select=lambda v, fp=file_path:
+                    self._file_override_set(fp, "resolution_height", v),
+            ),
+            self._make_radio_submenu(
+                title="FPS",
+                options=[("Original behalten", None), ("Auf 30 fps begrenzen", 30)],
+                current=fs.get("fps_limit", "GLOBAL") if "fps_limit" in fs else "GLOBAL",
+                global_label="Global verwenden",
+                on_select=lambda v, fp=file_path:
+                    self._file_override_set(fp, "fps_limit", v),
+            ),
+        ]:
+            item.set_sensitive(not is_done)
+            menu.append(item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -1537,6 +1545,7 @@ class MainWindow(Gtk.Window):
         is_stop = self._stop_after_path == file_path
         stop_label = "⏹  Nach dieser Datei stoppen ✓" if is_stop else "⏹  Nach dieser Datei stoppen"
         item_stop = Gtk.MenuItem(label=stop_label)
+        item_stop.set_sensitive(not is_done)
         item_stop.connect(
             "activate",
             lambda _, fp=file_path: self._set_stop_after(None if self._stop_after_path == fp else fp),
@@ -1554,7 +1563,7 @@ class MainWindow(Gtk.Window):
         else:
             move_label = "⬆  An den Anfang der Liste"
         item_move = Gtk.MenuItem(label=move_label)
-        item_move.set_sensitive(not is_encoding_this)
+        item_move.set_sensitive(not is_done and not is_encoding_this)
         item_move.connect("activate", lambda _, fp=file_path: self._move_to_front(fp))
         menu.append(item_move)
 
