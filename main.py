@@ -899,7 +899,9 @@ class MainWindow(Gtk.Window):
             self._store.set_value(row_iter, COL_PROGRESS, 0)
 
         fps = get_fps(path)
-        fps_note = f", HFR {fps:.1f} fps → Bitrate x2" if fps >= HIGH_FPS_THRESHOLD else ""
+        needs_fps_filter = job.fps_limit is not None and fps > job.fps_limit
+        fps_note = (f", HFR {fps:.1f} fps → Bitrate x2"
+                    if fps >= HIGH_FPS_THRESHOLD and not needs_fps_filter else "")
 
         target_h = job.resolution_height
         if target_h is not None:
