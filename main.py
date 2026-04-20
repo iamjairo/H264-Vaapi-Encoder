@@ -768,11 +768,14 @@ class MainWindow(Gtk.Window):
                 self._save_queue()
                 # Mirror the new order into self._jobs so _encode_next
                 # uses the correct sequence during active encoding.
+                # Files added after encoding started won't be in jobs_by_path,
+                # so build fresh jobs for them on demand.
                 if self._encoding_active and hasattr(self, "_jobs"):
                     jobs_by_path = {j.input_path: j for j in self._jobs}
-                    new_jobs = [jobs_by_path[p] for p in self._queue
-                                if p in jobs_by_path]
-                    # Keep the currently-encoding job at _current_index.
+                    new_jobs = [
+                        jobs_by_path[p] if p in jobs_by_path else self._build_job(p)
+                        for p in self._queue
+                    ]
                     self._jobs[:] = new_jobs
             Gtk.drag_finish(drag_context, src_iter is not None, False, time)
             return
@@ -796,20 +799,67 @@ class MainWindow(Gtk.Window):
                             self._add_file(os.path.join(root, f))
         Gtk.drag_finish(drag_context, True, False, time)
 
+    def _build_job(self, path: str) -> EncodeJob:
+        """Build an EncodeJob for *path* using the current UI settings."""
+        use_src_dir   = self._chk_src_dir.get_active()
+        replace_orig  = self._radio_replace.get_active()
+        keep_name     = self._radio_same_name.get_active()
+        output_dir    = self._entry_outdir.get_text().strip()
+        custom_suffix = self._entry_suffix.get_text().strip()
+        global_vbr    = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
+        global_abr    = AUDIO_BITRATES[self._combo_abr.get_active()][1]
+        global_res    = RESOLUTIONS[self._combo_res.get_active()][1]
+        global_fps    = 30 if self._chk_fps_limit.get_active() else None
+
+        out_path = make_output_path(
+            input_path=path,
+            output_dir=output_dir,
+            use_source_dir=use_src_dir,
+            replace_original=replace_orig,
+            keep_name=keep_name,
+            custom_suffix=custom_suffix,
+        )
+        fs = self._file_settings.get(path, {})
+        video_bitrate     = fs.get("video_bitrate",     global_vbr)
+        audio_bitrate     = fs.get("audio_bitrate",     global_abr)
+        resolution_height = fs.get("resolution_height", global_res)
+        fps_limit         = fs.get("fps_limit",         global_fps)
+        rotation          = fs.get("rotation", 0)
+
+        src = self._file_metadata.get(path, {})
+        if resolution_height is not None:
+            src_h = src.get("height", 0)
+            if src_h > 0 and src_h <= resolution_height:
+                resolution_height = None
+        if audio_bitrate is not None:
+            src_audio_kbps = src.get("audio_kbps")
+            if src_audio_kbps is not None:
+                if src_audio_kbps <= int(audio_bitrate.rstrip("k")):
+                    audio_bitrate = None
+
+        audio_streams, sub_streams = self._file_streams.get(path, ([], []))
+        sel_audio = [s["rel_idx"] for s in audio_streams if s["enabled"]]
+        sel_subs  = [s["rel_idx"] for s in sub_streams  if s["enabled"]]
+        return EncodeJob(
+            input_path=path,
+            output_path=out_path,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
+            replace_original=replace_orig,
+            resolution_height=resolution_height,
+            selected_audio=sel_audio if audio_streams else None,
+            selected_subtitles=sel_subs if sub_streams else None,
+            rotation=rotation,
+            fps_limit=fps_limit,
+        )
+
     def _on_start_encode(self, *_):
         if not self._queue:
             self._show_error("Keine Dateien in der Liste.")
             return
 
-        use_src_dir          = self._chk_src_dir.get_active()
-        replace_orig         = self._radio_replace.get_active()
-        keep_name            = self._radio_same_name.get_active()
-        output_dir           = self._entry_outdir.get_text().strip()
-        custom_suffix        = self._entry_suffix.get_text().strip()
-        global_video_bitrate = VIDEO_BITRATES[self._combo_vbr.get_active()][1]
-        global_audio_bitrate = AUDIO_BITRATES[self._combo_abr.get_active()][1]
-        global_resolution    = RESOLUTIONS[self._combo_res.get_active()][1]
-        global_fps_limit     = 30 if self._chk_fps_limit.get_active() else None
+        use_src_dir  = self._chk_src_dir.get_active()
+        output_dir   = self._entry_outdir.get_text().strip()
 
         if not use_src_dir and not output_dir:
             self._show_error("Bitte ein Ausgabeverzeichnis auswählen.")
@@ -817,58 +867,7 @@ class MainWindow(Gtk.Window):
 
         self._jobs: list[EncodeJob] = []
         for path in self._queue:
-            out_path = make_output_path(
-                input_path=path,
-                output_dir=output_dir,
-                use_source_dir=use_src_dir,
-                replace_original=replace_orig,
-                keep_name=keep_name,
-                custom_suffix=custom_suffix,
-            )
-            fs = self._file_settings.get(path, {})
-            # Per-file settings override global; absent key → use global.
-            video_bitrate     = fs["video_bitrate"]     if "video_bitrate"     in fs else global_video_bitrate
-            audio_bitrate     = fs["audio_bitrate"]     if "audio_bitrate"     in fs else global_audio_bitrate
-            resolution_height = fs["resolution_height"] if "resolution_height" in fs else global_resolution
-            fps_limit         = fs["fps_limit"]         if "fps_limit"         in fs else global_fps_limit
-            rotation          = fs.get("rotation", 0)
-
-            # No-upscaling guards (use cached probe data, no extra ffprobe call)
-            src = self._file_metadata.get(path, {})
-
-            # Resolution: if source is already smaller or equal, keep original
-            if resolution_height is not None:
-                src_h = src.get("height", 0)
-                if src_h > 0 and src_h <= resolution_height:
-                    resolution_height = None
-
-            # Audio bitrate: if source bitrate is at or below target, stream-copy
-            if audio_bitrate is not None:
-                src_audio_kbps = src.get("audio_kbps")
-                if src_audio_kbps is not None:
-                    target_kbps = int(audio_bitrate.rstrip("k"))
-                    if src_audio_kbps <= target_kbps:
-                        audio_bitrate = None  # stream-copy
-
-            audio_streams, sub_streams = self._file_streams.get(path, ([], []))
-            sel_audio = [s["rel_idx"] for s in audio_streams if s["enabled"]]
-            sel_subs  = [s["rel_idx"] for s in sub_streams  if s["enabled"]]
-            sel_audio_arg = sel_audio if audio_streams else None
-            sel_subs_arg  = sel_subs  if sub_streams  else None
-            self._jobs.append(
-                EncodeJob(
-                    input_path=path,
-                    output_path=out_path,
-                    video_bitrate=video_bitrate,
-                    audio_bitrate=audio_bitrate,
-                    replace_original=replace_orig,
-                    resolution_height=resolution_height,
-                    selected_audio=sel_audio_arg,
-                    selected_subtitles=sel_subs_arg,
-                    rotation=rotation,
-                    fps_limit=fps_limit,
-                )
-            )
+            self._jobs.append(self._build_job(path))
 
         self._encoding_active = True
         self._btn_encode.set_sensitive(False)
@@ -1207,14 +1206,17 @@ class MainWindow(Gtk.Window):
         self._sync_queue_from_store()
         self._save_queue()
 
-        # Also reorder _jobs so _encode_next processes files in the right order.
+        # Also reorder/insert into _jobs so _encode_next uses the right order.
         if self._encoding_active:
             insert_at = self._current_index + 1
             job_idx = next(
                 (i for i, j in enumerate(self._jobs) if j.input_path == file_path),
                 None,
             )
-            if job_idx is not None and job_idx != insert_at:
+            if job_idx is None:
+                # File was added after encoding started — build a fresh job.
+                self._jobs.insert(insert_at, self._build_job(file_path))
+            elif job_idx != insert_at:
                 job = self._jobs.pop(job_idx)
                 self._jobs.insert(insert_at, job)
 
