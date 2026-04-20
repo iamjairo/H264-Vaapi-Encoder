@@ -1003,7 +1003,11 @@ class MainWindow(Gtk.Window):
         # Fill streams and tech info: use cached metadata if available
         # (happens on queue restore), otherwise probe via ffprobe.
         def _probe():
-            meta = self._file_metadata.get(path) or get_file_metadata(path)
+            cached = self._file_metadata.get(path)
+            # Re-probe if audio streams exist but bitrate wasn't detected last time.
+            if cached and cached.get("audio") and cached.get("audio_kbps") is None:
+                cached = None
+            meta = cached or get_file_metadata(path)
 
             def _apply():
                 self._file_streams[path]   = (meta["audio"], meta["subtitles"])
